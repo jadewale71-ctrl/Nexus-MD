@@ -322,12 +322,12 @@ if (process.env.MONGO_URI) {
         useNewUrlParser: true,
         useUnifiedTopology: true,
     }).then(() => {
-        console.log("✅ MongoDB connected (single startup connect).");
+        console.log("[NEXUS-MD] MongoDB connected successfully.");
     }).catch((err) => {
-        console.error("❌ MongoDB connection error:", err);
+        console.error("[NEXUS-MD] MongoDB connection error:", err);
     });
 } else {
-    console.log("⚠️ MONGO_URI not provided — skipping MongoDB connection.");
+    console.log("[NEXUS-MD] MONGO_URI not set — skipping MongoDB.");
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -384,6 +384,8 @@ async function logMessage(type, pushname, senderNum, from, body, isFromMe, conn)
 // ── Supabase session manager (replaces GitHub-based loadSession) ─────────────
 // Handles session download, interactive auth menu fallback, and Supabase sync
 const { loadSession, makeSupabaseSaveCreds, deleteSession } = require('./lib/supabaseSession');
+const { restoreDB, startBackupSchedule } = require('./lib/dbBackup');
+const { printBanner } = require('./lib/banner');
 
 async function getGroupMetadataWithCache(conn, jid) {
     // Try cache first
@@ -417,7 +419,7 @@ const { lidToPhone, cleanPN } = require('./lib/lid'); // Import LID mapping
 
 async function connectToWA() {
     try {
-        console.log("Connecting Platinum v2 🧬...");
+        console.log("[NEXUS-MD] Connecting to WhatsApp...");
         await loadSession();
         const { state, saveCreds: _saveCreds } = await useMultiFileAuthState(__dirname + '/session/');
         const saveCreds = makeSupabaseSaveCreds(_saveCreds);
@@ -479,7 +481,7 @@ async function connectToWA() {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                console.log("📷 Scan this QR Code to connect:");
+                console.log("[NEXUS-MD] QR Code ready — scan with WhatsApp:");
                 qrcode.generate(qr, { small: true });
             }
 
@@ -494,9 +496,9 @@ async function connectToWA() {
                     console.log(`\n\x1b[92m┌─────────────────────────────┐`);
                     console.log(`│   Your Pairing Code: \x1b[1m${formatted}\x1b[0m\x1b[92m   │`);
                     console.log(`└─────────────────────────────┘\x1b[0m`);
-                    console.log('Go to WhatsApp > Linked Devices > Link with Phone Number and enter the code above.\n');
+                    console.log('[NEXUS-MD] Go to WhatsApp > Linked Devices > Link with Phone Number and enter the code above.\n');
                 } catch (err) {
-                    console.error('❌ Failed to get pairing code:', err.message);
+                    console.error('[NEXUS-MD] Failed to get pairing code:', err.message);
                 }
             }
             // === End pairing code ===
@@ -507,12 +509,12 @@ async function connectToWA() {
 
                 // ── Hard stop codes — do NOT reconnect ───────────────────────
                 if (reason === DisconnectReason.loggedOut) {
-                    console.error('❌ Logged out — session invalid. Re-authenticate.');
+                    console.error('[NEXUS-MD] Logged out — session invalid. Re-authenticate.');
                     await deleteSession();
                     process.exit(0);
                 }
                 if (reason === 401) {
-                    console.error('❌ Unauthorized (401) — session expired. Re-authenticate.');
+                    console.error('[NEXUS-MD] Unauthorized (401) — session expired. Re-authenticate.');
                     await deleteSession();
                     process.exit(0);
                 }
@@ -520,7 +522,7 @@ async function connectToWA() {
                 // ── Banned/restricted — wait longer before retry ───────────
                 const isBanned = reason === 403 || msg.includes('blocked') || msg.includes('banned');
                 if (isBanned) {
-                    console.warn('⚠️ Account may be restricted (403). Waiting 5 minutes before retry...');
+                    console.warn('[NEXUS-MD] Account may be restricted (403). Waiting 5 minutes before retry...');
                     setTimeout(() => connectToWA(), 5 * 60 * 1000);
                     return;
                 }
@@ -533,7 +535,7 @@ async function connectToWA() {
                 const max    = 5 * 60_000; // cap at 5 min
                 const delay  = Math.min(base * Math.pow(1.6, _reconnectAttempts - 1), max);
                 const secs   = Math.round(delay / 1000);
-                console.warn(`⚠️ Disconnected (${reason || 'unknown'}). Reconnecting in ${secs}s... (attempt ${_reconnectAttempts})`);
+                console.warn(`[NEXUS-MD] Disconnected (${reason || 'unknown'}). Reconnecting in ${secs}s... (attempt ${_reconnectAttempts})`);
                 setTimeout(() => {
                     _reconnecting = false;
                     connectToWA();
@@ -549,7 +551,7 @@ async function connectToWA() {
                             catch (e) { console.error(`[NEXUS-MD] Failed to load ${plugin}:`, e.message); }
                         }
                     });
-                    console.log(`✅ Plugins loaded: ${commands.length}`);
+                    console.log(`[NEXUS-MD] Plugins loaded: ${commands.length} files`);
                 } catch (e) { console.error('[NEXUS-MD] Plugin load error:', e); }
 
                 // Re-apply runtime settings AFTER plugins load (plugins may reset config defaults)
@@ -560,7 +562,7 @@ async function connectToWA() {
                     const _presenceInterval = setInterval(async () => {
                         try { await conn.sendPresenceUpdate('available', conn.user.id); } catch {}
                     }, 25000);
-                    console.log('✅ Always-online restored');
+                    console.log('[NEXUS-MD] Always-online presence restored.');
                 }
 
                 // Set bot as unavailable/offline immediately after connecting
@@ -569,9 +571,9 @@ async function connectToWA() {
                     await conn.sendPresenceUpdate('unavailable');
                 } catch {}
 
-                console.log('✅ NEXUS-MD connected to WhatsApp');
+                console.log('[NEXUS-MD] Connected to WhatsApp successfully.');
 
-                // ── Runtime settings ─────────────────────────────────────────
+                // ── Startup banner ────────────────────────────────────────
                 const _s     = botdb.getBotSettings();
                 const _pfx   = _s.prefix      || config.PREFIX    || ':';
                 const _mode  = _s.mode        || config.MODE      || 'public';
@@ -603,6 +605,17 @@ async function connectToWA() {
                         console.warn('[NEXUS-MD] Version check failed:', verErr.message);
                     }
                 }
+
+                // ── Startup banner (console) ──────────────────────────────────
+                printBanner({
+                    botName : _bname,
+                    version : _localVer,
+                    prefix  : _pfx,
+                    mode    : _modeLabel,
+                    owner   : _oname,
+                    port    : port,
+                    plugins : commands.length,
+                });
 
                 // ── Startup message (sent to bot's own number) ────────────────
                 const startMsg =
@@ -667,7 +680,7 @@ async function connectToWA() {
                     try {
                         await conn.readMessages([ mek.key ]);
                     } catch (err) {
-                        console.log("Error marking status as viewed:", err);
+                        console.error("[NEXUS-MD] Error marking status as viewed:", err);
                     }
                 }
                 return; // Don't process further for statuses
@@ -1308,7 +1321,7 @@ conn.ev.on('messages.update', async (updates) => {
 });
 
     } catch (error) {
-        console.error("❌ Error in connectToWA:", error);
+        console.error("[NEXUS-MD] Fatal error in connectToWA:", error);
         setTimeout(() => connectToWA(), 5000);
     }
 }
@@ -1318,7 +1331,7 @@ app.get('/',        (_, res) => res.json({ status: 'online', bot: config.BOT_NAM
 app.get('/health',  (_, res) => res.json({ status: 'ok' }));
 app.get('/ping',    (_, res) => res.send('pong'));
 
-app.listen(port, () => console.log(`🌐 Server running on port ${port}`));
+app.listen(port, () => console.log(`[NEXUS-MD] Server running on port ${port}`));
 
 // ── Self-ping to prevent Render/Heroku sleep (every 14 minutes) ──────────────
 // Only activates if SELF_URL env var is set (set it to your Render/Heroku URL)
@@ -1328,11 +1341,18 @@ if (process.env.SELF_URL) {
         try { await axios.get(selfUrl, { timeout: 10000 }); }
         catch {} // silently ignore — just to prevent dyno sleep
     }, 14 * 60 * 1000);
-    console.log(`🔁 Self-ping enabled → ${selfUrl}`);
+    console.log(`[NEXUS-MD] Self-ping enabled → ${selfUrl}`);
 }
 
+// Start DB backup schedule (every 30 min + on shutdown)
+startBackupSchedule();
+
 // Start the connection after a short delay.
-setTimeout(() => connectToWA(), 4000);
+// restoreDB runs first so nexus.db is in place before botdb.js reads it
+setTimeout(async () => {
+    await restoreDB();
+    connectToWA();
+}, 4000);
 startCleanup();
 
 module.exports = { store };
