@@ -36,9 +36,19 @@ let isInitialized = false;
 async function initializeAntiDeleteSettings() {
     if (isInitialized) return;
     try {
-        // Using alter: true adds the missing 'status_status' column to your existing DB
-        await AntiDelDB.sync({ alter: true }); 
-        
+        // Create table if it doesn't exist (safe, never duplicates)
+        await AntiDelDB.sync({ force: false });
+
+        // Manually add missing columns instead of alter:true (avoids UNIQUE constraint crash)
+        const qi = DATABASE.getQueryInterface();
+        const tableDesc = await qi.describeTable('antidelete');
+        if (!tableDesc.status_status) {
+            await qi.addColumn('antidelete', 'status_status', {
+                type: DataTypes.BOOLEAN,
+                defaultValue: false,
+            });
+        }
+
         await AntiDelDB.findOrCreate({
             where: { id: 1 },
             defaults: { gc_status: false, dm_status: false, status_status: false },
