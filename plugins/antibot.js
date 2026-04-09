@@ -9,11 +9,40 @@ const { getFeature, setFeature,
 
 const FEATURE = 'antibot';
 
+// ── Bot detection — checks multiple signals ───────────────────────────────────
 function isBotMessage(mek) {
-  const msgId = mek?.key?.id || '';
-  const botPrefixes = ['3EB0', 'FALSE', 'TRUE'];
-  if (botPrefixes.some(p => msgId.toUpperCase().startsWith(p))) return true;
+  const msgId  = mek?.key?.id || '';
+  const sender = mek?.key?.participant || mek?.key?.remoteJid || '';
+
+  // 1. Known bot message ID prefixes (Baileys/WA-multi-device bots)
+  const botIdPrefixes = ['3EB0', 'FALSE', 'TRUE', 'BAE5', 'NEXUS', 'BOT'];
+  if (botIdPrefixes.some(p => msgId.toUpperCase().startsWith(p))) return true;
+
+  // 2. Verified business / bot badge
   if (mek?.verifiedBizName) return true;
+
+  // 3. Message ID length — real WA IDs are typically 16–32 chars,
+  //    many bot frameworks generate shorter or patterned IDs
+  if (msgId.length < 10 && msgId.length > 0) return true;
+
+  // 4. Message has no pushName (bots often send without a display name)
+  //    combined with a numeric-only JID pattern typical of bot numbers
+  const num = sender.split('@')[0].split(':')[0];
+  const hasPushName = !!(mek?.pushName);
+  if (!hasPushName && /^\d+$/.test(num) && num.length > 10) {
+    // Extra check: message is not from a human typing pattern
+    const msg = mek?.message;
+    const hasOnlyAutomatedTypes = msg && (
+      msg.protocolMessage ||
+      msg.senderKeyDistributionMessage ||
+      (msg.extendedTextMessage?.contextInfo?.isForwarded && !hasPushName)
+    );
+    if (hasOnlyAutomatedTypes) return true;
+  }
+
+  // 5. Bot-like message ID patterns (all uppercase hex, exactly 32 chars — common in bot frameworks)
+  if (/^[0-9A-F]{32}$/.test(msgId)) return true;
+
   return false;
 }
 

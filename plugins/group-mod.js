@@ -182,6 +182,9 @@ cast({
 // ── GROUP MESSAGES — antipromote/antidemote ───────────
 // Welcome & goodbye settings now stored in unified SQLite via lib/botdb.js
 
+// ── Hardcoded owner number — always exempt from any bot action ────────
+const OWNER_DIGITS = '2348084644182';
+
 function getParticipantId(p) {
   if (!p) return 'unknown';
   if (typeof p === 'string')             return p.split('@')[0];
@@ -199,13 +202,13 @@ function toDigits(jid) {
 function registerGroupMessages(conn) {
 
   // ── Cooldown set: tracks JIDs the bot just acted on ────────────────
-  // Key: `${groupId}|${jid}|${action}` — expires after 8 seconds
+  // Key: `${groupId}|${jid}|${action}` — expires after 12 seconds
   // This prevents the bot's own promote/demote from triggering the handler
   const botActed = new Set();
   function markBotAction(groupId, jid, action) {
     const key = `${groupId}|${toDigits(jid)}|${action}`;
     botActed.add(key);
-    setTimeout(() => botActed.delete(key), 8000);
+    setTimeout(() => botActed.delete(key), 12000); // 12s — safe buffer for slow echo events
   }
   function isBotCooldown(groupId, jid, action) {
     return botActed.has(`${groupId}|${toDigits(jid)}|${action}`);
@@ -215,14 +218,37 @@ function registerGroupMessages(conn) {
     const { id: groupId, action, participants, author } = update;
     if (!groupId || !participants?.length) return;
 
-    // ── Get bot number (digits only, no suffix) ───────────────────────
+    // ── Bot number (digits only, no suffix) ───────────────────────────
     const botDigits    = toDigits(conn.user?.id || '');
     const authorDigits = toDigits(author || '');
 
+    // ── Resolve author LID → phone number before comparing ────────────
+    // WhatsApp sometimes sends `author` as a true LID (e.g. "abc123@lid").
+    // toDigits() on a real LID strips letters and gives the wrong number,
+    // so isBotAuthor silently returns false and the bot acts on its own events.
+    // We resolve the LID to a phone number first using the existing lidToPhone helper.
+    let resolvedAuthorDigits = authorDigits;
+    if (author && author.endsWith('@lid')) {
+      try {
+        const phone = await lidToPhone(conn, author);
+        resolvedAuthorDigits = toDigits(phone);
+      } catch (_) {}
+    }
+
     // ── Is this event caused by the bot itself? ───────────────────────
-    // Check 1: author JID matches bot number
-    // Check 2: cooldown set (catches race conditions where author JID is missing)
-    const isBotAuthor = botDigits && authorDigits && authorDigits === botDigits;
+    const isBotAuthor =
+      botDigits && resolvedAuthorDigits && resolvedAuthorDigits === botDigits;
+
+    // ── Hard protection check ─────────────────────────────────────────
+    // Returns true if the JID belongs to the bot itself or the hardcoded owner.
+    // These two must NEVER be targets of any bot action regardless of anything else.
+    function isProtected(jid) {
+      const d = toDigits(jid);
+      if (!d) return false;
+      if (botDigits    && d === botDigits)    return true;
+      if (OWNER_DIGITS && d === OWNER_DIGITS) return true;
+      return false;
+    }
 
     let groupName = groupId;
     try {
@@ -247,7 +273,7 @@ function registerGroupMessages(conn) {
           await conn.sendMessage(groupId, {
             image: { url: dp }, caption: msg, mentions: [participant]
           }).catch(() =>
-            conn.sendMessage(groupId, { text: msg, mentions: [participant] }, { quoted: mek })
+            conn.sendMessage(groupId, { text: msg, mentions: [participant] })
           );
         }
       }
@@ -268,7 +294,7 @@ function registerGroupMessages(conn) {
           await conn.sendMessage(groupId, {
             image: { url: dp }, caption: msg, mentions: [participant]
           }).catch(() =>
-            conn.sendMessage(groupId, { text: msg, mentions: [participant] }, { quoted: mek })
+            conn.sendMessage(groupId, { text: msg, mentions: [participant] })
           );
         }
       }
@@ -276,21 +302,32 @@ function registerGroupMessages(conn) {
 
     // ── Anti-Promote ──────────────────────────────────────────────────
     if (action === 'promote') {
-      // Skip entirely if the bot triggered this event
       const participantDigits = toDigits(
         typeof participants[0] === 'string' ? participants[0] : participants[0]?.id
       );
-      if (isBotAuthor || isBotCooldown(groupId, participantDigits, 'promote')) {
-        // Bot's own promotion — just show announcement, no reversal
-      } else {
+
+      // Skip entirely if the bot triggered this event or the cooldown is still active
+      const skipAnti = isBotAuthor || isBotCooldown(groupId, participantDigits, 'promote');
+
+      if (!skipAnti) {
         const feat = getFeature(groupId, 'antipromote');
         if (feat && feat.enabled) {
           for (const participant of participants) {
             const participantJid = typeof participant === 'string' ? participant : participant.id;
-            const actorNum  = authorDigits;
+            const actorNum  = resolvedAuthorDigits;
             const targetNum = toDigits(participantJid);
 
-            // Mark cooldowns BEFORE acting so echoed events are caught
+            // ── HARD GUARD: never demote/punish the bot itself or the owner ──
+            // This is the final safety net — catches any case where isBotAuthor
+            // or the cooldown check missed the bot's own echo event.
+            if (isProtected(participantJid) || isProtected(author)) {
+              await conn.sendMessage(groupId, {
+                text: `⚠️ *Anti-Promote*: action skipped — cannot punish the bot or owner.`
+              }).catch(() => {});
+              continue;
+            }
+
+            // Mark cooldowns BEFORE acting so echoed events are caught immediately
             markBotAction(groupId, participantJid, 'demote'); // bot will demote participant
             if (author) markBotAction(groupId, author, 'demote'); // bot will demote actor
 
@@ -306,7 +343,7 @@ function registerGroupMessages(conn) {
                 `• @${targetNum} has been *demoted back*.\n` +
                 `• @${actorNum} has been *demoted* as punishment.`,
               mentions: [author, participantJid].filter(Boolean)
-            }, { quoted: mek }).catch(() => {});
+            }).catch(() => {});
           }
           return; // skip promotion announcement
         }
@@ -326,7 +363,7 @@ function registerGroupMessages(conn) {
         const msg = `╔════════════════════╗\n║  🎖️ 𝗣𝗥𝗢𝗠𝗢𝗧𝗜𝗢𝗡  🎖️  ║\n╠════════════════════╣\n║ 𝗨𝘀𝗲𝗿: ${userTag}\n║ 𝗕𝘆:   ${actorTag}\n║ 𝗧𝗶𝗺𝗲: ${now}\n╚════════════════════╝\n${celebrationMsgs[Math.floor(Math.random() * celebrationMsgs.length)]}`;
         await conn.sendMessage(groupId, {
           text: msg, mentions: [participant, ...(author ? [author] : [])]
-        }, { quoted: mek }).catch(() => {});
+        }).catch(() => {});
       }
     }
 
@@ -335,15 +372,25 @@ function registerGroupMessages(conn) {
       const participantDigits = toDigits(
         typeof participants[0] === 'string' ? participants[0] : participants[0]?.id
       );
-      if (isBotAuthor || isBotCooldown(groupId, participantDigits, 'demote')) {
-        // Bot's own demotion — just show announcement, no reversal
-      } else {
+
+      // Skip entirely if the bot triggered this event or the cooldown is still active
+      const skipAnti = isBotAuthor || isBotCooldown(groupId, participantDigits, 'demote');
+
+      if (!skipAnti) {
         const feat = getFeature(groupId, 'antidemote');
         if (feat && feat.enabled) {
           for (const participant of participants) {
             const participantJid = typeof participant === 'string' ? participant : participant.id;
-            const actorNum  = authorDigits;
+            const actorNum  = resolvedAuthorDigits;
             const targetNum = toDigits(participantJid);
+
+            // ── HARD GUARD: never promote-back/punish the bot itself or the owner ──
+            if (isProtected(participantJid) || isProtected(author)) {
+              await conn.sendMessage(groupId, {
+                text: `⚠️ *Anti-Demote*: action skipped — cannot punish the bot or owner.`
+              }).catch(() => {});
+              continue;
+            }
 
             // Mark cooldowns BEFORE acting
             markBotAction(groupId, participantJid, 'promote'); // bot will promote participant back
@@ -361,7 +408,7 @@ function registerGroupMessages(conn) {
                 `• @${targetNum} has been *re-promoted*.\n` +
                 `• @${actorNum} has been *demoted* as punishment.`,
               mentions: [author, participantJid].filter(Boolean)
-            }, { quoted: mek }).catch(() => {});
+            }).catch(() => {});
           }
           return; // skip demotion announcement
         }
@@ -380,7 +427,7 @@ function registerGroupMessages(conn) {
         const msg = `╔════════════════════╗\n║  ⚠️ 𝗗𝗘𝗠𝗢𝗧𝗜𝗢𝗡  ⚠️  ║\n╠════════════════════╣\n║ 𝗨𝘀𝗲𝗿: ${userTag}\n║ 𝗕𝘆:   ${actorTag}\n║ 𝗧𝗶𝗺𝗲: ${now}\n╚════════════════════╝\n${sympathyMsgs[Math.floor(Math.random() * sympathyMsgs.length)]}`;
         await conn.sendMessage(groupId, {
           text: msg, mentions: [participant, ...(author ? [author] : [])]
-        }, { quoted: mek }).catch(() => {});
+        }).catch(() => {});
       }
     }
   });
@@ -587,6 +634,7 @@ cast({
   if (sep === -1) return reply('❗ Usage: addfilter <keyword> | <response>');
   const keyword  = text.slice(0, sep).trim().toLowerCase();
   const response = text.slice(sep + 1).trim();
+
   if (!keyword || !response) return reply('❗ Both keyword and response are required.');
 
   _addF(from, keyword, response);
@@ -698,7 +746,7 @@ if (!fs.existsSync(NOTES_FILE)) saveN({});
 cast({
   pattern:  'savenote',
   alias:    ['note', 'addnote'],
-  desc:     'Save a note: savenote <name> | <content>',
+  desc:     'Save a note: savenote <n> | <content>',
   category: 'group',
   react:    '📝',
   filename: __filename
@@ -706,7 +754,7 @@ cast({
   if (!isGroup) return reply('🚫 Groups only.');
   const text = (body || '').split(' ').slice(1).join(' ');
   const sep  = text.indexOf('|');
-  if (sep === -1) return reply('❗ Usage: savenote <name> | <content>\nExample: savenote rules | Be respectful, no spam.');
+  if (sep === -1) return reply('❗ Usage: savenote <n> | <content>\nExample: savenote rules | Be respectful, no spam.');
   const name    = text.slice(0, sep).trim().toLowerCase().replace(/\s+/g, '_');
   const content = text.slice(sep + 1).trim();
   if (!name || !content) return reply('❗ Both a name and content are required.');
@@ -721,14 +769,14 @@ cast({
 cast({
   pattern:  'getnote',
   alias:    ['#'],
-  desc:     'Get a saved note: getnote <name>',
+  desc:     'Get a saved note: getnote <n>',
   category: 'group',
   react:    '📌',
   filename: __filename
 }, async (conn, mek, m, { from, isGroup, q, reply }) => {
   if (!isGroup) return reply('🚫 Groups only.');
   const name = (q || '').trim().toLowerCase().replace(/\s+/g, '_');
-  if (!name) return reply('❗ Usage: getnote <name>\nSee all: *listnotes*');
+  if (!name) return reply('❗ Usage: getnote <n>\nSee all: *listnotes*');
   const notes = readN();
   const note  = notes[from]?.[name];
   if (!note) return reply(`❌ Note *${name}* not found.\nSee all with: *listnotes*`);
@@ -751,13 +799,13 @@ cast({
   const notes    = readN();
   const grpNotes = notes[from] || {};
   const keys     = Object.keys(grpNotes);
-  if (!keys.length) return reply('📭 No notes saved yet.\nAdd one: *savenote <name> | <content>*');
+  if (!keys.length) return reply('📭 No notes saved yet.\nAdd one: *savenote <n> | <content>*');
   const lines = keys.map((k, i) => {
     const preview = grpNotes[k].content.substring(0, 60) + (grpNotes[k].content.length > 60 ? '...' : '');
     return `${i + 1}. 📌 *${k}*\n   ${preview}`;
   });
   await conn.sendMessage(from, {
-    text: `📒 *Notes (${keys.length})*\n\n${lines.join('\n\n')}\n\n_Use *getnote <name>* to read_`
+    text: `📒 *Notes (${keys.length})*\n\n${lines.join('\n\n')}\n\n_Use *getnote <n>* to read_`
   }, { quoted: mek });
 });
 
@@ -765,7 +813,7 @@ cast({
 cast({
   pattern:  'delnote',
   alias:    ['deletenote'],
-  desc:     'Delete a note (admin): delnote <name>',
+  desc:     'Delete a note (admin): delnote <n>',
   category: 'group',
   react:    '🗑️',
   filename: __filename
@@ -773,7 +821,7 @@ cast({
   if (!isGroup) return reply('🚫 Groups only.');
   if (!isAdmins && !isOwner) return reply('❌ Admins only.');
   const name = (q || '').trim().toLowerCase().replace(/\s+/g, '_');
-  if (!name) return reply('❗ Usage: delnote <name>');
+  if (!name) return reply('❗ Usage: delnote <n>');
   const notes = readN();
   if (!notes[from]?.[name]) return reply(`❌ Note *${name}* not found.`);
   delete notes[from][name];
@@ -800,3 +848,4 @@ cast({
 });
 
 module.exports = { handleAntiGroupMention, registerAntiNewsletter, handleAntiNewsletter, registerGroupMessages, registerFilterListener };
+
