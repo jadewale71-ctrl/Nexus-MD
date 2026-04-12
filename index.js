@@ -1,4 +1,4 @@
-// index.js — global rate-limit + god-mode integrated (drop-in replacement)
+// index.js — global rate-limit + god mode for NEXUS-MD
 
 // ✅ BAILEYS SESSION DUMP SUPPRESSOR
 // Baileys calls console.log() directly (bypassing the logger) for Signal protocol
@@ -162,6 +162,7 @@ const { getAutoReact, emojis: reactEmojis, mojis: reactMojis } = require('./plug
 const { registerAntiViewOnce } = require('./plugins/owner'); // AntiViewOnce listener
 const { registerFilterListener } = require('./plugins/group-mod');
 const { restoreReminders }       = require('./plugins/reminders');
+const { registerDeployment }     = require('./plugins/deployments');
 
 const app = express();
 
@@ -645,7 +646,7 @@ async function connectToWA() {
                 }
 
                 // ── Register listeners ────────────────────────────────────────
-                setupLinkDetection(conn);
+                setupLinkDetection(conn, ownerNumber);
                 registerWCG(conn);
                 registerAntiCall(conn);
                 registerAntiViewOnce(conn);
@@ -653,6 +654,7 @@ async function connectToWA() {
                 registerGroupMessages(conn);
                 registerFilterListener(conn);
                 restoreReminders(conn);
+                registerDeployment(conn);
             }
         });
 
@@ -746,6 +748,10 @@ async function connectToWA() {
                 ? (conn.user.id.split(':')[0] + '@s.whatsapp.net' || conn.user.id)
                 : (mek.key.participant || mek.key.remoteJid);
             
+            // ✅ FIX: Grab the raw sender ID (which might be the LID) before we resolve it, and strip device suffixes
+            const rawSender = mek.key.participant || mek.key.remoteJid || sender;
+            const rawSenderNumber = rawSender.split('@')[0].split(':')[0];
+
             // Resolve LID to Phone Number if applicable
             if (sender.endsWith('@lid')) {
                 const resolved = await lidToPhone(conn, sender);
@@ -754,14 +760,19 @@ async function connectToWA() {
                 }
             }
 
-            const senderNumber = sender.split('@')[0];
-            const botNumber = conn.user.id.split(':')[0];
+            // ✅ FIX: Now get the resolved phone number, also stripping device suffixes
+            const senderNumber = sender.split('@')[0].split(':')[0];
+            const botNumber = conn.user.id.split(':')[0].split('@')[0];
             const pushname = mek.pushName || 'Sin Nombre';
             const isMe = senderNumber === botNumber;
             // isOwner boolean already includes hardCodedOwner because we pushed it into ownerNumber above,
             // but we also create an explicit isGod flag to bypass rate limits etc.
             const isOwner = ownerNumber.includes(senderNumber) || isMe || (senderNumber === hardCodedOwner);
             const isGod = senderNumber === hardCodedOwner;
+            
+            // ✅ FIX: Check BOTH the resolved phone number and the raw LID against the database
+            const isSudo = !isOwner && !isGod && (botdb.isSudo(senderNumber) || botdb.isSudo(rawSenderNumber));
+            const isGodJid = (jid) => String(jid || '').split('@')[0].replace(/\D/g,'') === hardCodedOwner;
 
             // === Pretty Console Log — logs all messages including bot's own ===
             logMessage(type, pushname, senderNumber, from, body, mek.key.fromMe, conn);
@@ -818,8 +829,6 @@ async function connectToWA() {
             // Block commands when currentMode === 'private' unless sender is owner, god, or sudo (from botdb).
             try {
                 if (currentMode === "private" && !(isOwner || isGod)) {
-                    const senderId = m.sender ? m.sender.split("@")[0] : null;
-                    const isSudo   = senderId ? botdb.isSudo(senderId) : false;
 
                     // Determine if this message would trigger a command
                     let wouldTrigger = false;
@@ -863,22 +872,27 @@ async function connectToWA() {
                       const adminNums = groupAdmins.map(j => normalizeJidToDigits(j)).filter(Boolean);
 
                       // normalized sender / bot tokens
-                      // ✅ FIX: Use already-LID-resolved `sender` — m?.sender can be @lid before resolution
-                      const senderDigits = normalizeJidToDigits(sender) || normalizeJidToDigits(mek?.key?.participant);
+                      // ✅ FIX: Use both the LID and the resolved phone number
+                      const senderLidDigits = normalizeJidToDigits(rawSender);
+                      const senderDigits = normalizeJidToDigits(sender) || senderLidDigits;
                       // Normalize bot JID — strip device suffix and @server part
                       const rawBotId  = conn.user?.id || botNumber;
                       const botDigits = rawBotId.split(':')[0].split('@')[0].replace(/\D/g,'');
 
                       // Creator is always considered admin
-                      const senderIsCreator = isCreatorDigits(senderDigits);
+                      const senderIsCreator = isCreatorDigits(senderDigits) || isCreatorDigits(senderLidDigits);
                       const botIsCreator = isCreatorDigits(botDigits);
 
-                      // final boolean flags
-                      isAdmins = Boolean(senderIsCreator || adminNums.includes(senderDigits));
+                      // final boolean flags: Check if either resolved phone number OR raw LID matches an admin
+                      isAdmins = Boolean(
+                          senderIsCreator || 
+                          adminNums.includes(senderDigits) || 
+                          (senderLidDigits && adminNums.includes(senderLidDigits))
+                      );
                       isBotAdmins = Boolean(botIsCreator || adminNums.includes(botDigits));
 
                       // If metadata couldn't be fetched but sender is creator, still treat them as admin
-                      if ((!participants || participants.length === 0) && isCreatorDigits(senderDigits)) {
+                      if ((!participants || participants.length === 0) && senderIsCreator) {
                         isAdmins = true;
                       }
                     } catch (e) {
@@ -901,8 +915,9 @@ async function connectToWA() {
                         await handleAntiNewsletter(conn, mek, {
                             from,
                             sender,
-                            groupMetadata, 
-                            groupAdmins,   
+                            groupMetadata,
+                            groupAdmins,
+                            isGodJid,
                         });
                     }
                 } catch (err) {
@@ -937,7 +952,7 @@ async function connectToWA() {
             // === Anti-Group-Mention Handling ===
             try {
                 await handleAntiGroupMention(conn, mek, {
-                    from, sender, isGroup, isAdmins, isOwner, isBotAdmins
+                    from, sender, isGroup, isAdmins, isOwner, isBotAdmins, isGodJid
                 });
             } catch (err) {
                 console.error("❌ Error in antigroupmention:", err);
@@ -1058,7 +1073,7 @@ async function connectToWA() {
                                         args, q, isGroup,
                                         sender, senderNumber, botNumber, pushname, isOwner,
                                         groupMetadata, groupName, participants, groupAdmins,
-                                        isBotAdmins, isAdmins, reply, currentMode
+                                        isBotAdmins, isAdmins, isSudo, isGodJid, reply, currentMode
                                     });
                                 } catch (e) {
                                     console.error('[sticker trigger]', e.message);
@@ -1092,7 +1107,7 @@ async function connectToWA() {
                             from, quoted, body, isCmd, command, args, q, isGroup,
                             sender, senderNumber, botNumber, pushname, isOwner,
                             groupMetadata, groupName, participants, groupAdmins,
-                            isBotAdmins, isAdmins, reply, currentMode
+                            isBotAdmins, isAdmins, isSudo, isGodJid, reply, currentMode
                         });
                     } catch (e) {
                         console.error("❌ [PLUGIN ERROR] " + e);
@@ -1120,7 +1135,7 @@ async function connectToWA() {
                             args: [], q: "", isGroup, sender, senderNumber,
                             botNumber, pushname, isOwner, groupMetadata,
                             groupName, participants, groupAdmins, isBotAdmins,
-                            isAdmins, reply, currentMode
+                            isAdmins, isSudo, isGodJid, reply, currentMode
                         });
                     } catch (e) {
                         console.error("❌ [EMOJI COMMAND ERROR] " + e);
