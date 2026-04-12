@@ -2,34 +2,11 @@
 // All data stored in unified SQLite via lib/botdb.js
 
 'use strict';
-
 const { makeSmartQuote } = require('../cast');
+
 const { cast }       = require('../cast');
 const botdb   = require('../lib/botdb');
 const config  = require('../config');
-const { lidToPhone, resolveJidDisplay } = require('../lib/lid');
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ✅ HELPER FUNCTIONS
-// ─────────────────────────────────────────────────────────────────────────────
-const extractMentions = (m, mek) => {
-  try { if (Array.isArray(m?.mentions) && m.mentions.length) return m.mentions; } catch {}
-  try { if (Array.isArray(m?.mentionedJid) && m.mentionedJid.length) return m.mentionedJid; } catch {}
-  try {
-    for (const t of ['extendedTextMessage','imageMessage','videoMessage','documentMessage']) {
-      const ctx = mek?.message?.[t]?.contextInfo;
-      if (ctx && Array.isArray(ctx.mentionedJid) && ctx.mentionedJid.length) return ctx.mentionedJid;
-    }
-  } catch {}
-  return [];
-};
-
-// Converts an LID (or JID) into a clean phone number strictly for @tagging
-async function getCleanNum(conn, jid) {
-    if (!jid) return 'Unknown';
-    const pn = await lidToPhone(conn, jid);
-    return pn.split('@')[0];
-}
 
 // ── Text helpers ─────────────────────────────────────────────────────────────
 function normalizeText(text = '') {
@@ -126,8 +103,6 @@ async function enforceBadwords(conn, mek, m, opts = {}) {
 
     const senderId = mek.key?.participant || m?.sender;
     if (!senderId) return { handled: false };
-    
-    const cleanSender = await getCleanNum(conn, senderId);
 
     // 2. Add fallback to prevent silent crashes if settings are undefined
     const settings = botdb.getGroupSettings(chatId) || {};
@@ -145,18 +120,18 @@ async function enforceBadwords(conn, mek, m, opts = {}) {
     if (action === 'reply') {
       await del();
       await conn.sendMessage(chatId, {
-        text: `⚠️ @${cleanSender} — Bad language not allowed here.`,
+        text: `⚠️ @${senderId.split('@')[0]} — Bad language not allowed here.`,
         mentions: [senderId]
-      }, { quoted: makeSmartQuote() }).catch(() => {});
+      }, { quoted: mek }).catch(() => {});
       return { handled: true, reason: 'replied' };
     }
 
     if (action === 'kick') {
       await conn.groupParticipantsUpdate(chatId, [senderId], 'remove').catch(() => {});
       await conn.sendMessage(chatId, {
-        text: `👢 @${cleanSender} removed for using banned words.`,
+        text: `👢 @${senderId.split('@')[0]} removed for using banned words.`,
         mentions: [senderId]
-      }, { quoted: makeSmartQuote() }).catch(() => {});
+      }, { quoted: mek }).catch(() => {});
       return { handled: true, reason: 'kicked' };
     }
 
@@ -164,9 +139,9 @@ async function enforceBadwords(conn, mek, m, opts = {}) {
       botdb.addToBlacklist(senderId, 'badword');
       await del();
       await conn.sendMessage(chatId, {
-        text: `🚫 @${cleanSender} blacklisted for bad language.`,
+        text: `🚫 @${senderId.split('@')[0]} blacklisted for bad language.`,
         mentions: [senderId]
-      }, { quoted: makeSmartQuote() }).catch(() => {});
+      }, { quoted: mek }).catch(() => {});
       return { handled: true, reason: 'banned' };
     }
 
@@ -180,31 +155,31 @@ async function enforceBadwords(conn, mek, m, opts = {}) {
       if (warnAction === 'kick') {
         await conn.groupParticipantsUpdate(chatId, [senderId], 'remove').catch(() => {});
         await conn.sendMessage(chatId, {
-          text: `👢 @${cleanSender} removed — reached ${count}/${limit} warnings.`,
+          text: `👢 @${senderId.split('@')[0]} removed — reached ${count}/${limit} warnings.`,
           mentions: [senderId]
-        }, { quoted: makeSmartQuote() }).catch(() => {});
+        }, { quoted: mek }).catch(() => {});
         botdb.resetWarning(chatId, senderId);
       } else if (warnAction === 'ban') {
         botdb.addToBlacklist(senderId, 'warn limit');
         await conn.sendMessage(chatId, {
-          text: `🚫 @${cleanSender} blacklisted — reached ${count}/${limit} warnings.`,
+          text: `🚫 @${senderId.split('@')[0]} blacklisted — reached ${count}/${limit} warnings.`,
           mentions: [senderId]
-        }, { quoted: makeSmartQuote() }).catch(() => {});
+        }, { quoted: mek }).catch(() => {});
         botdb.resetWarning(chatId, senderId);
       } else {
         await conn.sendMessage(chatId, {
-          text: `⚠️ @${cleanSender} — Reached max warnings (${count}/${limit}).`,
+          text: `⚠️ @${senderId.split('@')[0]} — Reached max warnings (${count}/${limit}).`,
           mentions: [senderId]
-        }, { quoted: makeSmartQuote() }).catch(() => {});
+        }, { quoted: mek }).catch(() => {});
         botdb.resetWarning(chatId, senderId);
       }
       return { handled: true, reason: 'warn_limit_reached' };
     }
 
     await conn.sendMessage(chatId, {
-      text: `⚠️ @${cleanSender} — Warning *${count}/${limit}*`,
+      text: `⚠️ @${senderId.split('@')[0]} — Warning *${count}/${limit}*`,
       mentions: [senderId]
-    }, { quoted: makeSmartQuote() }).catch(() => {});
+    }, { quoted: mek }).catch(() => {});
     return { handled: true, reason: 'warned' };
 
   } catch (err) {
@@ -218,38 +193,32 @@ cast({
   pattern: 'ban', alias: ['addignorelist','banchat'],
   desc: 'Blacklist and block a user (owner only)',
   category: 'owner', filename: __filename,
-}, async (conn, mek, m, { reply, isOwner, isSudo }) => {
+}, async (conn, mek, m, { reply, isOwner }) => {
   if (!isOwner) return reply('⛔ Owner only.');
-  const _bm = extractMentions(m, mek);
-  const target = (_bm.length && _bm[0]) || (m.quoted && m.quoted.sender);
+  const target = (m.mentionedJid && m.mentionedJid[0]) || (m.quoted && m.quoted.sender);
   if (!target) return reply('Mention or reply to the user to ban.');
   const jid = target.includes('@') ? target : target.replace(/\D/g,'') + '@s.whatsapp.net';
-  
-  const cleanTarget = await getCleanNum(conn, jid);
   botdb.addToBlacklist(jid, 'manual ban');
   try { await conn.updateBlockStatus(jid, 'block').catch(()=>{}); } catch {}
   try {
     if (m.chat?.endsWith('@g.us'))
       await conn.groupParticipantsUpdate(m.chat, [jid], 'remove').catch(()=>{});
   } catch {}
-  return reply(`✅ *${cleanTarget}* has been banned and blocked.`);
+  return reply(`✅ *${jid.split('@')[0]}* has been banned and blocked.`);
 });
 
 cast({
   pattern: 'unban', alias: ['delignorelist'],
   desc: 'Remove user from blacklist (owner only)',
   category: 'owner', filename: __filename,
-}, async (conn, mek, m, { reply, isOwner, isSudo }) => {
+}, async (conn, mek, m, { reply, isOwner }) => {
   if (!isOwner) return reply('⛔ Owner only.');
-  const _ubm = extractMentions(m, mek);
-  const target = (_ubm.length && _ubm[0]) || (m.quoted && m.quoted.sender);
+  const target = (m.mentionedJid && m.mentionedJid[0]) || (m.quoted && m.quoted.sender);
   if (!target) return reply('Mention or reply to the user to unban.');
   const jid = target.includes('@') ? target : target.replace(/\D/g,'') + '@s.whatsapp.net';
-  
-  const cleanTarget = await getCleanNum(conn, jid);
   botdb.removeFromBlacklist(jid);
   try { await conn.updateBlockStatus(jid, 'unblock').catch(()=>{}); } catch {}
-  return reply(`✅ *${cleanTarget}* has been unbanned.`);
+  return reply(`✅ *${jid.split('@')[0]}* has been unbanned.`);
 });
 
 // ── ALWAYSONLINE ──────────────────────────────────────────────────────────────
@@ -257,7 +226,7 @@ cast({
   pattern: 'alwaysonline',
   desc: 'Toggle presence heartbeat on/off (owner only)',
   category: 'owner', filename: __filename,
-}, async (conn, mek, m, { args, reply, isOwner, isSudo }) => {
+}, async (conn, mek, m, { args, reply, isOwner }) => {
   if (!isOwner) return reply('⛔ Owner only.');
   const opt = (args[0]||'').toLowerCase();
   if (!['on','off'].includes(opt)) return reply('Usage: alwaysonline on/off');
@@ -270,9 +239,9 @@ cast({
   pattern: 'setwarn', alias: ['setwarnlimit2'],
   desc: 'Set warn limit for this group',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, args, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, args, reply }) => {
   if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const n = parseInt(args[0]);
   if (!n || n < 1 || n > 20) return reply('Provide a valid number (1–20).');
   botdb.setGroupSetting(from, 'warn_limit', n);
@@ -283,17 +252,12 @@ cast({
   pattern: 'listwarn', alias: ['warnlist2'],
   desc: 'List warned users in this group',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, reply }) => {
   if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const rows = botdb.listWarnings(from);
   if (!rows.length) return reply('No warnings recorded. 🎉');
-  
-  const lines = await Promise.all(rows.map(async (r) => {
-      const cleanNum = await getCleanNum(conn, r.user_jid);
-      return `• @${cleanNum} — *${r.count}*`;
-  }));
-  return reply(`*Warnings:*\n${lines.join('\n')}`);
+  return reply(`*Warnings:*\n${rows.map(r => `• @${r.user_jid.split('@')[0]} — *${r.count}*`).join('\n')}`);
 });
 
 module.exports = { enforceBadwords, handleGroupParticipantsUpdate };
@@ -307,9 +271,9 @@ cast({
   pattern: 'addbadword', alias: ['badword', 'bw'],
   desc: 'Add a word to the badwords list for this group',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, args, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, args, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const word = args.join(' ').trim().toLowerCase();
   if (!word) return reply('❗ Usage: addbadword <word>');
   botdb.addBadword(from, word);
@@ -321,9 +285,9 @@ cast({
   pattern: 'removebadword', alias: ['delbadword', 'rmbw'],
   desc: 'Remove a word from the badwords list',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, args, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, args, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const word = args.join(' ').trim().toLowerCase();
   if (!word) return reply('❗ Usage: removebadword <word>');
   botdb.removeBadword(from, word);
@@ -335,9 +299,9 @@ cast({
   pattern: 'badwords', alias: ['listbw', 'bwlist'],
   desc: 'List all badwords for this group',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const rows = botdb.listBadwords(from).filter(r => r.group_jid === from);
   if (!rows.length) return reply('📭 No badwords set for this group.');
   return reply(`🔞 *Badwords (${rows.length}):*\n${rows.map((r,i) => `${i+1}. ${r.word}`).join('\n')}`);
@@ -348,9 +312,9 @@ cast({
   pattern: 'setbadwordaction', alias: ['bwaction'],
   desc: 'Set action for badwords: warn | delete | kick | ban | none',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, args, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, args, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const opt = (args[0] || '').toLowerCase();
   const valid = ['warn','delete','kick','ban','none','reply'];
   if (!valid.includes(opt)) return reply(`❗ Valid actions: ${valid.join(', ')}`);
@@ -363,9 +327,9 @@ cast({
   pattern: 'setwarnlimit', alias: ['warnlimit'],
   desc: 'Set warning limit before action (default: 3)',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, args, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, args, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const n = parseInt(args[0]);
   if (!n || n < 1 || n > 20) return reply('❗ Provide a number between 1 and 20.');
   botdb.setGroupSetting(from, 'warn_limit', n);
@@ -377,9 +341,9 @@ cast({
   pattern: 'setwarnaction', alias: ['warnaction'],
   desc: 'Set action when warn limit is reached: kick | ban',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, args, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, args, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const opt = (args[0] || '').toLowerCase();
   if (!['kick','ban'].includes(opt)) return reply('❗ Valid: kick | ban');
   botdb.setGroupSetting(from, 'on_warn_limit', opt);
@@ -391,26 +355,19 @@ cast({
   pattern: 'warn',
   desc: 'Warn a group member (mention or reply to their message)',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, isGodJid, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
 
-  const _mentions = extractMentions(m, mek);
   const target =
-    (_mentions.length && _mentions[0]) ||
-    (m.quoted && m.quoted.sender)      || null;
+    (m.mentionedJid && m.mentionedJid[0]) ||
+    (m.quoted && m.quoted.sender)         || null;
   if (!target) return reply('❗ Mention a user or reply to their message.');
-
-  // Protect the hardcoded owner from being warned
-  if (isGodJid(target))
-    return reply("😂 *I can't warn my creator!*");
 
   const settings   = botdb.getGroupSettings(from) || {};
   const limit      = settings.warn_limit    || 3;
   const warnAction = settings.on_warn_limit || 'kick';
   const count      = botdb.incrementWarning(from, target);
-  
-  const cleanTarget = await getCleanNum(conn, target);
 
   if (count >= limit) {
     if (warnAction === 'kick') {
@@ -420,15 +377,15 @@ cast({
     }
     botdb.resetWarning(from, target);
     return conn.sendMessage(from, {
-      text: `👢 @${cleanTarget} has been *${warnAction === 'kick' ? 'kicked' : 'banned'}* — reached ${limit}/${limit} warnings.`,
+      text: `👢 @${target.split('@')[0]} has been *${warnAction === 'kick' ? 'kicked' : 'banned'}* — reached ${limit}/${limit} warnings.`,
       mentions: [target]
-    }, { quoted: makeSmartQuote() });
+    }, { quoted: mek });
   }
 
   return conn.sendMessage(from, {
-    text: `⚠️ @${cleanTarget} — Warning *${count}/${limit}*`,
+    text: `⚠️ @${target.split('@')[0]} — Warning *${count}/${limit}*`,
     mentions: [target]
-  }, { quoted: makeSmartQuote() });
+  }, { quoted: mek });
 });
 
 // ── resetwarn ────────────────────────────────────────────────────────────────
@@ -436,16 +393,15 @@ cast({
   pattern: 'resetwarn', alias: ['clearwarn'],
   desc: 'Reset warnings for a user (mention or reply)',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
-  const _rwm = extractMentions(m, mek);
-  const target = (_rwm.length && _rwm[0]) || (m.quoted && m.quoted.sender) || null;
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
+  const target =
+    (m.mentionedJid && m.mentionedJid[0]) ||
+    (m.quoted && m.quoted.sender)         || null;
   if (!target) return reply('❗ Mention a user or reply to their message.');
   botdb.resetWarning(from, target);
-  
-  const cleanTarget = await getCleanNum(conn, target);
-  return reply(`✅ Warnings cleared for @${cleanTarget}`);
+  return reply(`✅ Warnings cleared for @${target.split('@')[0]}`);
 });
 
 // ── warnings ─────────────────────────────────────────────────────────────────
@@ -453,17 +409,13 @@ cast({
   pattern: 'warnings', alias: ['warnlist', 'warned'],
   desc: 'List warned users in this group',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
   const rows  = botdb.listWarnings(from);
   const limit = (botdb.getGroupSettings(from) || {}).warn_limit || 3;
   if (!rows.length) return reply('📭 No warnings recorded in this group.');
-  
-  const lines = await Promise.all(rows.map(async (r, i) => {
-      const cleanNum = await getCleanNum(conn, r.user_jid);
-      return `${i+1}. @${cleanNum} — *${r.count}/${limit}*`;
-  }));
+  const lines = rows.map((r,i) => `${i+1}. @${r.user_jid.split('@')[0]} — *${r.count}/${limit}*`);
   return reply(`⚠️ *Warnings (${rows.length}):*\n${lines.join('\n')}`);
 });
 
@@ -472,16 +424,15 @@ cast({
   pattern: 'blacklist', alias: ['bl'],
   desc: 'Blacklist a user (mention, reply, or number)',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isOwner, isSudo, isAdmins, args, reply }) => {
-  if (!isOwner && !isAdmins && !isSudo) return reply('⛔ Admins only.');
-  const _blm = extractMentions(m, mek);
-  const target = (_blm.length && _blm[0]) || (m.quoted && m.quoted.sender) ||
+}, async (conn, mek, m, { from, isOwner, isAdmins, args, reply }) => {
+  if (!isOwner && !isAdmins) return reply('⛔ Admins only.');
+  const target =
+    (m.mentionedJid && m.mentionedJid[0]) ||
+    (m.quoted && m.quoted.sender)         ||
     (args[0] && args[0].replace(/\D/g,'') + '@s.whatsapp.net') || null;
   if (!target) return reply('❗ Mention, reply, or provide a number.');
   botdb.addToBlacklist(target, 'manual');
-  
-  const cleanTarget = await getCleanNum(conn, target);
-  return reply(`🚫 *${cleanTarget}* blacklisted.`);
+  return reply(`🚫 *${target.split('@')[0]}* blacklisted.`);
 });
 
 // ── unblacklist ───────────────────────────────────────────────────────────────
@@ -489,16 +440,15 @@ cast({
   pattern: 'unblacklist', alias: ['unbl', 'removebl'],
   desc: 'Remove a user from the blacklist',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isOwner, isSudo, isAdmins, args, reply }) => {
-  if (!isOwner && !isAdmins && !isSudo) return reply('⛔ Admins only.');
-  const _ublm = extractMentions(m, mek);
-  const target = (_ublm.length && _ublm[0]) || (m.quoted && m.quoted.sender) ||
+}, async (conn, mek, m, { from, isOwner, isAdmins, args, reply }) => {
+  if (!isOwner && !isAdmins) return reply('⛔ Admins only.');
+  const target =
+    (m.mentionedJid && m.mentionedJid[0]) ||
+    (m.quoted && m.quoted.sender)         ||
     (args[0] && args[0].replace(/\D/g,'') + '@s.whatsapp.net') || null;
   if (!target) return reply('❗ Mention, reply, or provide a number.');
   botdb.removeFromBlacklist(target);
-  
-  const cleanTarget = await getCleanNum(conn, target);
-  return reply(`✅ *${cleanTarget}* removed from blacklist.`);
+  return reply(`✅ *${target.split('@')[0]}* removed from blacklist.`);
 });
 
 // ── blacklisted ───────────────────────────────────────────────────────────────
@@ -506,15 +456,11 @@ cast({
   pattern: 'blacklisted', alias: ['bllist'],
   desc: 'Show all blacklisted users',
   category: 'moderation', filename: __filename,
-}, async (conn, mek, m, { from, isOwner, isSudo, reply }) => {
+}, async (conn, mek, m, { from, isOwner, reply }) => {
   if (!isOwner) return reply('⛔ Owner only.');
   const rows = botdb.getBlacklist();
   if (!rows.length) return reply('📭 No blacklisted users.');
-  
-  const lines = await Promise.all(rows.map(async (r, i) => {
-      const cleanNum = await getCleanNum(conn, r.user_jid);
-      return `${i+1}. @${cleanNum}${r.reason ? ` — ${r.reason}` : ''}`;
-  }));
+  const lines = rows.map((r,i) => `${i+1}. @${r.user_jid.split('@')[0]}${r.reason ? ` — ${r.reason}` : ''}`);
   return reply(`🚫 *Blacklisted (${rows.length}):*\n${lines.join('\n')}`);
 });
 
@@ -526,9 +472,9 @@ cast({
   category: 'moderation',
   use:      '<count> (reply or @mention user)',
   filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, args, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, args, reply }) => {
   if (!isGroup)              return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
+  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
 
   // Resolve target: quoted sender OR first @mention
   const mentionedJid =
@@ -555,15 +501,13 @@ cast({
     .sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0))
     .slice(0, limit);
 
-  const displayTarget = await getCleanNum(conn, target);
-
   if (!userMsgs.length)
-    return reply(`📭 No recent messages found from @${displayTarget}`);
+    return reply(`📭 No recent messages found from @${targetNum}`);
 
   await conn.sendMessage(from, {
-    text: `⏳ Deleting *${userMsgs.length}* message(s) from @${displayTarget}...`,
+    text: `⏳ Deleting *${userMsgs.length}* message(s) from @${targetNum}...`,
     mentions: [target]
-  }, { quoted: makeSmartQuote() });
+  }, { quoted: mek });
 
   let deleted = 0;
   for (const msg of userMsgs) {
@@ -572,69 +516,9 @@ cast({
   }
 
   await conn.sendMessage(from, {
-    text: `✅ Deleted *${deleted}/${userMsgs.length}* messages from @${displayTarget}.`,
+    text: `✅ Deleted *${deleted}/${userMsgs.length}* messages from @${targetNum}.`,
     mentions: [target]
-  }, { quoted: makeSmartQuote() });
-});
-
-// ── PURGE ─────────────────────────────────────────────────────────────────────
-cast({
-  pattern:  'purge',
-  alias:    ['delall', 'clearmsgs'],
-  desc:     'Delete the last N messages from everyone in the group',
-  category: 'moderation',
-  use:      '<count>',
-  filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, args }) => {
-  
-  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 *Groups only.*' }, { quoted: makeSmartQuote() });
-  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '⚠️ *Admins only.*' }, { quoted: makeSmartQuote() });
-
-  // Cap at 50 to prevent WhatsApp rate-limiting or getting the bot flagged
-  const limit = Math.min(parseInt(args?.[0]) || 0, 50);
-  if (!limit) return await conn.sendMessage(from, { text: '❗ Specify how many messages to delete (max 50).\n*Example:* purge 10' }, { quoted: makeSmartQuote() });
-
-  // Pull from local message store
-  let store;
-  try { store = require('../index').store; } catch {}
-  const chatMsgs = store?.messages?.[from];
-  
-  // Safely extract the message array (handles both Baileys .array format and standard object maps)
-  const msgsArray = chatMsgs?.array || (chatMsgs ? Object.values(chatMsgs) : []);
-
-  if (!msgsArray || !msgsArray.length) {
-    return await conn.sendMessage(from, { 
-      text: '📭 No stored messages for this chat yet.\n_Messages are cached after the bot sees them._' 
-    }, { quoted: makeSmartQuote() });
-  }
-
-  // Sort by timestamp descending (newest first) and grab the requested amount
-  const targetMsgs = msgsArray
-    .sort((a, b) => (b.messageTimestamp || 0) - (a.messageTimestamp || 0))
-    .slice(0, limit);
-
-  if (!targetMsgs.length) {
-    return await conn.sendMessage(from, { text: '📭 No recent messages found to delete.' }, { quoted: makeSmartQuote() });
-  }
-
-  await conn.sendMessage(from, {
-    text: `⏳ Purging the last *${targetMsgs.length}* message(s)...`
-  }, { quoted: makeSmartQuote() });
-
-  let deleted = 0;
-  for (const msg of targetMsgs) {
-    try { 
-      // Send the delete protocol message
-      await conn.sendMessage(from, { delete: msg.key }); 
-      deleted++; 
-    } catch {}
-    // 350ms delay to prevent rate limiting
-    await new Promise(r => setTimeout(r, 350));
-  }
-
-  await conn.sendMessage(from, {
-    text: `✅ Successfully purged *${deleted}/${targetMsgs.length}* messages.`
-  }, { quoted: makeSmartQuote() });
+  }, { quoted: mek });
 });
 
 // ── ANTILINK ──────────────────────────────────────────────────────────────────
@@ -645,11 +529,11 @@ cast({
   desc:     'Manage anti-link for this group. Modes: kick | delete | warn | off',
   category: 'moderation',
   filename: __filename,
-}, async (conn, mek, m, { from, args, isGroup, isAdmins, isOwner, isSudo, reply }) => {
+}, async (conn, mek, m, { from, args, isGroup, isAdmins, isOwner, reply }) => {
   if (!isGroup) return reply('🚫 Groups only.');
 
   // Fallback admin check in case isAdmins wasn't resolved
-  let admin = isAdmins || isOwner || isSudo;
+  let admin = isAdmins || isOwner;
   if (!admin) {
     try {
       const meta    = await conn.groupMetadata(from);
@@ -668,10 +552,10 @@ cast({
     return reply(
       `🔗 *Antilink* — current mode: *${cur || 'off'}*\n\n` +
       `*Usage:* antilink <mode>\n` +
-      `  *kick* — remove member who sends link\n` +
+      `  *kick*   — remove member who sends link\n` +
       `  *delete* — delete the link only\n` +
-      `  *warn* — warn member (uses setwarnlimit)\n` +
-      `  *off* — disable antilink`
+      `  *warn*   — warn member (uses setwarnlimit)\n` +
+      `  *off*    — disable antilink`
     );
   }
 

@@ -1,178 +1,118 @@
-const { cast, makeSmartQuote, commands, applyFont } = require('../cast');
+const { cast, makeSmartQuote, commands } = require('../cast');
 const config = require('../config');
-
-const { formatBytes, getLocalBuffer, runtime, tiny, getBuffer } = require('../lib/functions');
-const { platform, totalmem, freemem } = require('os');
-const { join } = require('path');
-const fs = require('fs');
-const fsp = fs.promises;
+const { formatBytes, runtime, getBuffer } = require('../lib/functions');
+const { totalmem, freemem } = require('os');
 const botdb = require('../lib/botdb');
 
-// helper: load/save settings via botdb
 function loadSettings() { return botdb.getBotSettings(); }
 async function saveSettings(obj) { botdb.saveBotSettings(obj); }
 
-// formats categorized commands into an object { category: [patterns...] }
-function categorizeCommands(commandsList) {
-  const categorized = {};
-  commandsList.forEach(cmdItem => {
-    if (!cmdItem || !cmdItem.pattern || cmdItem.dontAddCommandList) return;
-    const name = cmdItem.pattern;
-    const cat = (cmdItem.category || 'misc').toLowerCase();
-    if (!categorized[cat]) categorized[cat] = [];
-    categorized[cat].push(name);
-  });
-  return categorized;
+// ── Small-caps map ─────────────────────────────────────────────────────────────
+function sc(str) {
+  const m = {
+    a:'ᴀ',b:'ʙ',c:'ᴄ',d:'ᴅ',e:'ᴇ',f:'ғ',g:'ɢ',h:'ʜ',i:'ɪ',
+    j:'ᴊ',k:'ᴋ',l:'ʟ',m:'ᴍ',n:'ɴ',o:'ᴏ',p:'ᴘ',q:'ǫ',r:'ʀ',
+    s:'s',t:'ᴛ',u:'ᴜ',v:'ᴠ',w:'ᴡ',x:'x',y:'ʏ',z:'ᴢ'
+  };
+  return str.toLowerCase().split('').map(c => m[c] || c).join('');
 }
 
-// menu renderer: returns { text, imageBufferOrNull }
-// header/info is built once and placed at the top — categories appended after
-async function renderMenu({ layout = 1, pushname = 'User', from, m }) {
+// ── Categorise commands ────────────────────────────────────────────────────────
+function categorizeCommands(list) {
+  const out = {};
+  list.forEach(cmd => {
+    if (!cmd || !cmd.pattern || cmd.dontAddCommandList) return;
+    const cat = (cmd.category || 'misc').toLowerCase();
+    (out[cat] = out[cat] || []).push(cmd.pattern);
+  });
+  return out;
+}
+
+// ── Detect media type ──────────────────────────────────────────────────────────
+function detectMediaType(url) {
+  const ext = (url.split('?')[0].split('.').pop() || '').toLowerCase();
+  if (ext === 'gif') return 'gif';
+  if (['mp4', 'mov', 'mkv', 'webm', 'avi'].includes(ext)) return 'video';
+  return 'image';
+}
+
+// ── RAM bar ────────────────────────────────────────────────────────────────────
+function ramBar(pct, len = 10) {
+  const f = Math.round((pct / 100) * len);
+  return '[' + '█'.repeat(f) + '░'.repeat(len - f) + `] ${pct}%`;
+}
+
+// ── Core renderer — returns ONE long text string (like Cypher X) ───────────────
+async function renderMenu({ layout = 1, pushname = 'User' }) {
   const settings = await loadSettings();
-  const botName = config.BOT_NAME || 'NEXUS-MD';
-  const dateTime = new Date().toLocaleString('en-GB', { timeZone: 'UTC' });
-  const memUsed = formatBytes(totalmem() - freemem());
-  const pluginCount = commands.length;
-  const version = config.VERSION || '?.?.?';
-  const categorized = categorizeCommands(commands);
+  const botName  = config.BOT_NAME || 'NEXUS-MD';
+  const prefix   = config.PREFIX   || config.prefix || '.';
+  const mode     = config.MODE     || 'Unknown';
+  const version  = config.VERSION  || '1.0.0';
+  const uptime   = runtime(process.uptime());
+  const memUsed  = formatBytes(totalmem() - freemem());
+  const memPct   = Math.round(((totalmem() - freemem()) / totalmem()) * 100);
+  const plugins  = commands.length;
+  const cats     = categorizeCommands(commands);
+  const catKeys  = Object.keys(cats);
 
-  // Single header block used by every layout
-  const headerBlock = [
-    `┌─❖ ${botName} ❖─┐`,
-    `│ User: ${pushname}`,
-    `│ Mode: ${config.MODE || 'Unknown'}`,
-    `│ Uptime: ${runtime(process.uptime())}`,
-    `│ Date/Time: ${dateTime}`,
-    `│ Platform: ${platform()}`,
-    `│ Memory: ${memUsed}`,
-    `│ Plugins: ${pluginCount}`,
-    `│ Version: ${version}`,
-    `└──────────────┘`,
-    ''
-  ].join('\n');
+  const rows = [
+    [sc('user'),    pushname],
+    [sc('prefix'),  `[ ${prefix} ]`],
+    [sc('mode'),    mode],
+    [sc('uptime'),  uptime],
+    [sc('plugins'), String(plugins)],
+    [sc('version'), version],
+    [sc('memory'),  memUsed],
+    [sc('ram'),     ramBar(memPct)],
+  ];
 
+  // Helpers per layout
+  const H = {
+    open:    (n, name) => ({ 1:`┏◈ ≺ *${name}* ≻ ◈`, 2:`▛▀ ❰ *${name}* ❱`, 3:`╔═❮ *${name}* ❯`, 4:`⟦ *${name}* ⟧`, 5:`✦ ≪ *${name}* ≫ ✦`, 6:`◤◢ *${name}* ◢◤`, 7:`━ *${name}* ━`, 8:`【 *${name}* 】`, 9:`⎯ *${name}* ⎯` }[n] || `*${name}*`),
+    row:     (n, k, v) => ({ 1:`┃ *${k}* : ${v}`, 2:`▌ *${k}* : ${v}`, 3:`╟ *${k}* : ${v}`, 4:`│ *${k}* : ${v}`, 5:`✧ *${k}* : ${v}`, 6:`◈ *${k}* : ${v}`, 7:`  *${k}* : ${v}`, 8:`〉*${k}* : ${v}`, 9:`⌁ *${k}* : ${v}` }[n] || `${k}: ${v}`),
+    close:   (n) => ({ 1:'┗◈', 2:'▙▟', 3:'╚═', 4:'⟦⟧', 5:'✦✦', 6:'◤◢', 7:'━━', 8:'【】', 9:'⎯⎯' }[n] || ''),
+    catOpen: (n, cat) => ({ 1:`┏◈ ≺ *${cat}*`, 2:`▛▀ ❰ *${cat}* ❱`, 3:`╔═❮ *${cat}*`, 4:`⟦ *${cat}* ⟧`, 5:`✦ ≪ *${cat}* ≫`, 6:`◤◢ *${cat}*`, 7:`━ *${cat}*`, 8:`【 *${cat}* 】`, 9:`⎯ *${cat}* ⎯` }[n] || `*${cat}*`),
+    bullet:  (n, p) => ({ 1:`┃⇒ ${p}`, 2:`▌⟡ ${p}`, 3:`║◦ ${p}`, 4:`│› ${p}`, 5:`✧▸ ${p}`, 6:`◈➤ ${p}`, 7:`  ▹${p}`, 8:`〉${p}`, 9:`⌁${p}` }[n] || ` • ${p}`),
+    catClose:(n) => ({ 1:'┗◈', 2:'▙▟', 3:'╚═', 4:'⟦⟧', 5:'✦✦', 6:'◤◢', 7:'━━', 8:'【】', 9:'⎯⎯' }[n] || ''),
+  };
+
+  const L = Number(layout);
   let text = '';
 
-  switch (Number(layout)) {
-    // Layout 1 — compact boxed header + category lists (keeps its original style but still includes header)
-    case 1:
-      text += headerBlock;
-      text += `╭─❏ *${botName}* ❏\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `*${cat.toUpperCase()}* — ${categorized[cat].length} commands\n`;
-        categorized[cat].forEach(p => { text += ` • ${p}\n`; });
-        text += `\n`;
-      });
-      break;
+  // ── Header ───────────────────────────────────────────────────────────────────
+  text += H.open(L, botName) + '\n';
+  rows.forEach(([k, v]) => { text += H.row(L, k, v) + '\n'; });
+  text += H.close(L) + '\n';
 
-    // Layout 2 — emoji grouped
-    case 2:
-      text += headerBlock;
-      text += `✨ *${botName} — Menu (Layout 2)* ✨\n`;
-      text += `👤 ${pushname}  •  ⚙️ ${config.MODE || 'Unknown'}  •  ⏱ ${runtime(process.uptime())}\n`;
-      text += `📅 ${dateTime}  •  🧠 ${memUsed}  •  🔌 ${pluginCount}\n\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `╭─❏ *${cat.toUpperCase()}* ❏\n`;
-        categorized[cat].forEach(p => text += `│ ◦ ${p}\n`);
-        text += `╰──────────────❏\n`;
-      });
-      break;
+  // ── Invisible separator to push categories below readmore threshold ───────────
+  // 700+ invisible chars forces WhatsApp to show "Read more" before categories
+  text += '\u200B'.repeat(750) + '\n';
 
-    // Layout 3 — boxed title + categories (header appears once)
-    case 3:
-      text += headerBlock;
-      text += `┏━━━━━┓  ${botName}  ┏━━━━━┓\n\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `【 ${cat.toUpperCase()} 】\n`;
-        categorized[cat].forEach(p => text += ` - ${p}\n`);
-        text += `\n`;
-      });
-      text += `_Tip: use 'setmenu <1-9>' to change layout. Use 'setmenu image <url>' to set the menu image._\n`;
-      break;
+  // ── All categories in one block (like Cypher X — one long message) ───────────
+  catKeys.forEach(cat => {
+    text += '\n' + H.catOpen(L, cat.toUpperCase()) + '\n';
+    cats[cat].forEach(p => { text += H.bullet(L, p) + '\n'; });
+    text += H.catClose(L) + '\n';
+  });
 
-    // Layout 4 — minimal plain list
-    case 4:
-      text += headerBlock;
-      text += `*${botName} — Commands*\n\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `${cat.toUpperCase()}:\n`;
-        categorized[cat].forEach(p => (text += `${p} `));
-        text += `\n\n`;
-      });
-      break;
-
-    // Layout 5 — cosmic (header then numbered commands per category)
-    case 5:
-      text += headerBlock;
-      text += `🌌 *${botName} — Cosmic Menu* 🌌\n\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `✨ ${cat.toUpperCase()} ✨\n`;
-        categorized[cat].forEach((p, i) => text += ` ${i + 1}. ${p}\n`);
-        text += `\n`;
-      });
-      break;
-
-    // Layout 6 — artistic framed categories
-    case 6:
-      text += headerBlock;
-      text += `🎨 *${botName} — Artistic Menu* 🎨\n\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `┌─ ${cat.toUpperCase()} ─┐\n`;
-        categorized[cat].forEach(p => text += `│ • ${p}\n`);
-        text += `└─────────────┘\n\n`;
-      });
-      break;
-
-    // Layout 7 — space layout header once then list
-    case 7:
-      text += headerBlock;
-      text += `🪐 *${botName} — Space Layout* 🪐\n\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `🚀 ${cat.toUpperCase()} 🚀\n`;
-        categorized[cat].forEach(p => text += ` ➤ ${p}\n`);
-        text += `\n`;
-      });
-      break;
-
-    // Layout 8 — minimal modern with header once
-    case 8:
-      text += headerBlock;
-      text += `🔹 *${botName} — Minimal Modern* 🔹\n\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `• ${cat.toUpperCase()} •\n`;
-        text += categorized[cat].join(' | ') + '\n\n';
-      });
-      break;
-
-    // Layout 9 — fancy boxed categories with header once
-    case 9:
-      text += headerBlock;
-      text += `💠 *${botName} — Fancy Box Layout* 💠\n\n`;
-      Object.keys(categorized).forEach(cat => {
-        text += `╔═[ ${cat.toUpperCase()} ]═╗\n`;
-        categorized[cat].forEach(p => text += `║ ${p}\n`);
-        text += `╚═════════════╝\n\n`;
-      });
-      break;
-
-    default:
-      text = headerBlock + `Unknown menu layout ${layout}. Use setmenu 1-9 to choose.`;
+  // ── Media ────────────────────────────────────────────────────────────────────
+  let mediaBuffer = null;
+  let mediaType   = 'image';
+  const mediaUrl  = settings.menuImage;
+  if (mediaUrl && /^https?:\/\//i.test(mediaUrl)) {
+    mediaType = detectMediaType(mediaUrl);
+    try { mediaBuffer = await getBuffer(mediaUrl); } catch { mediaBuffer = null; }
   }
 
-  // If the user configured a menuImage (must be http(s)), attempt to fetch it and return as imageBuffer
-  let imageBuffer = null;
-  if (settings.menuImage && typeof settings.menuImage === 'string' && /^https?:\/\//i.test(settings.menuImage)) {
-    try { imageBuffer = await getBuffer(settings.menuImage); } catch (e) { imageBuffer = null; }
-  }
-
-  return { text, imageBuffer };
+  return { text, mediaBuffer, mediaType };
 }
 
-// MENU COMMAND
+// ── MENU command ───────────────────────────────────────────────────────────────
 cast(
   {
     pattern: 'menu',
-    desc: 'Show all commands (multi-layout)',
+    desc: 'Show all commands (9 slim layouts)',
     category: 'main',
     filename: __filename
   },
@@ -180,65 +120,87 @@ cast(
     try {
       const settings = await loadSettings();
       const layout = settings.menuLayout || 1;
-      const { text, imageBuffer } = await renderMenu({ layout, pushname, from, m });
+      const { text, mediaBuffer, mediaType } = await renderMenu({ layout, pushname });
+      const q = { quoted: makeSmartQuote() };
 
-      if (imageBuffer) {
-        await conn.sendMessage(
-          from,
-          { image: imageBuffer, caption: text, contextInfo: { mentionedJid: [m.sender] } },
-          { quoted: makeSmartQuote() }
-        );
+      if (mediaBuffer) {
+        if (mediaType === 'video') {
+          await conn.sendMessage(from, { video: mediaBuffer, caption: text }, q);
+        } else if (mediaType === 'gif') {
+          await conn.sendMessage(from, { video: mediaBuffer, gifPlayback: true, caption: text }, q);
+        } else {
+          await conn.sendMessage(from, { image: mediaBuffer, caption: text }, q);
+        }
       } else {
-        await conn.sendMessage(from, { text }, { quoted: makeSmartQuote() });
+        await conn.sendMessage(from, { text }, q);
       }
-    } catch (error) {
-      console.error(error);
+    } catch (err) {
+      console.error(err);
       reply('An error occurred while generating the menu.');
     }
   }
 );
 
-// SETMENU COMMAND (no owner check; anyone can change)
+// ── SETMENU command ────────────────────────────────────────────────────────────
 cast(
   {
     pattern: 'setmenu',
-    desc: 'Set menu layout or image. Usage: setmenu <1-9> | setmenu image <url> | setmenu removeimage | setmenu show',
-    category: 'owner',
+    desc: 'Set menu layout or media. Usage: setmenu <1-9> | setmenu image/video/gif <url> | setmenu removeimage | setmenu show',
+    category: 'settings',
     filename: __filename
   },
   async (conn, mek, m, { from, args, reply }) => {
     try {
       const settings = await loadSettings();
-      if (!args || args.length === 0) return reply('Usage:\nsetmenu <1-9>\nsetmenu image <http(s)://...>\nsetmenu removeimage\nsetmenu show');
+
+      if (!args || args.length === 0) {
+        return reply(
+          '*setmenu* options:\n' +
+          '  setmenu *1-9*          — change layout\n' +
+          '  setmenu *image* <url>  — set image header\n' +
+          '  setmenu *video* <url>  — set video header\n' +
+          '  setmenu *gif* <url>    — set GIF header\n' +
+          '  setmenu *removeimage*  — remove media\n' +
+          '  setmenu *show*         — current settings'
+        );
+      }
 
       const sub = args[0].toLowerCase();
 
       if (/^[1-9]$/.test(sub)) {
         settings.menuLayout = Number(sub);
         await saveSettings(settings);
-        return reply(`Menu layout set to ${sub}.`);
+        return reply(`✅ Menu layout set to *${sub}*.`);
       }
 
-      if (sub === 'image' && args[1]) {
-        const url = args[1].trim();
-        if (!/^https?:\/\//i.test(url)) return reply('Provide a valid http(s) image URL.');
+      if (['image', 'video', 'gif', 'media'].includes(sub)) {
+        const url = (args[1] || '').trim();
+        if (!url || !/^https?:\/\//i.test(url)) {
+          return reply('Provide a valid http(s) URL.\nExample: setmenu image https://i.imgur.com/xyz.jpg');
+        }
         settings.menuImage = url;
         await saveSettings(settings);
-        return reply('Menu image set. (Will be used next time someone opens the menu)');
+        return reply(`✅ Menu media saved as *${detectMediaType(url)}*.\nApplied next time *.menu* is run.`);
       }
 
       if (sub === 'removeimage') {
         delete settings.menuImage;
         await saveSettings(settings);
-        return reply('Menu image removed.');
+        return reply('✅ Menu media removed.');
       }
 
       if (sub === 'show') {
-        const current = { menuLayout: settings.menuLayout || 1, menuImage: settings.menuImage || '(none)' };
-        return reply(`Current menu settings:\n${JSON.stringify(current, null, 2)}`);
+        const mu = settings.menuImage || '(none)';
+        const mt = settings.menuImage ? detectMediaType(settings.menuImage) : '—';
+        return reply(
+          `*Menu settings:*\n` +
+          `  Layout : ${settings.menuLayout || 1}\n` +
+          `  Media  : ${mu}\n` +
+          `  Type   : ${mt}`
+        );
       }
 
-      return reply('Unknown option. Usage:\nsetmenu <1-9>\nsetmenu image <url>\nsetmenu removeimage\nsetmenu show');
+      return reply('Unknown option. Type *setmenu* alone to see usage.');
     } catch (err) {
       console.error(err);
       reply('Failed to update menu settings.');

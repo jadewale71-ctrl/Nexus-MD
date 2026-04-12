@@ -9,56 +9,77 @@ const path = require('path');
 const { getFeature, setFeature, setFeatureMode, getGroupSettings,
         incrementFeatureWarn, resetFeatureWarn, getFeatureWarn } = require('../lib/botdb');
 const { lidToPhone } = require('../lib/lid');
+const { jidNormalizedUser } = require('@whiskeysockets/baileys'); 
+
+// ── Resolve the EXACT JID WhatsApp expects for group operations ───────────────
+async function resolveParticipantJid(conn, groupJid, rawJid) {
+  try {
+    const digits = String(rawJid).split(':')[0].split('@')[0].replace(/\D/g, '');
+    const meta   = await conn.groupMetadata(groupJid);
+    const match  = (meta?.participants || []).find(p => {
+      const pDigits = String(p.id || '').split(':')[0].split('@')[0].replace(/\D/g, '');
+      return pDigits === digits;
+    });
+    if (match) return match.id;
+    
+    if (rawJid.endsWith('@lid')) {
+      const phone = await lidToPhone(conn, rawJid).catch(() => null);
+      if (phone) return phone.includes('@') ? phone : phone + '@s.whatsapp.net';
+    }
+    return jidNormalizedUser(rawJid);
+  } catch {
+    return jidNormalizedUser(rawJid);
+  }
+}
 
 // ── ANTI GROUP MENTION ────────────────────────────────
-// cast + botdb imported at top
 
 const FEATURE   = 'antigroupmention';
 
-// ── Toggle command ────────────────────────────────────────────────────────────
 cast({
   pattern: 'antigroupmention',
   desc: 'Enable/Disable anti group status mention',
   category: 'group',
   filename: __filename,
-}, async (conn, mek, m, { from, args, isGroup, isAdmins, isOwner, reply }) => {
-  if (!isGroup) return reply('❌ Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+}, async (conn, mek, m, { from, args, isGroup, isAdmins, isOwner, isSudo }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '❌ Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '❌ Admins only.' }, { quoted: makeSmartQuote() });
 
   const f = getFeature(from, FEATURE);
 
   if (!args[0]) {
-    return reply(`🔘 AntiGroupMention is *${f.enabled ? 'ON' : 'OFF'}*`);
+    return await conn.sendMessage(from, { text: `🔘 AntiGroupMention is *${f.enabled ? 'ON' : 'OFF'}*` }, { quoted: makeSmartQuote() });
   }
 
   const opt = args[0].toLowerCase();
   if (opt === 'on') {
     setFeature(from, FEATURE, true, '');
-    return reply('✅ AntiGroupMention enabled.');
+    return await conn.sendMessage(from, { text: '✅ AntiGroupMention enabled.' }, { quoted: makeSmartQuote() });
   }
   if (opt === 'off') {
     setFeature(from, FEATURE, false, '');
-    return reply('❌ AntiGroupMention disabled.');
+    return await conn.sendMessage(from, { text: '❌ AntiGroupMention disabled.' }, { quoted: makeSmartQuote() });
   }
-  return reply('Use: antigroupmention on/off');
+  return await conn.sendMessage(from, { text: 'Use: antigroupmention on/off' }, { quoted: makeSmartQuote() });
 });
 
-// ── Handler (called from index.js per-message) ────────────────────────────────
 async function handleAntiGroupMention(conn, mek, context) {
-  const { from, sender, isGroup, isAdmins, isOwner, isBotAdmins } = context;
+  const { from, sender, isGroup, isAdmins, isOwner, isGodJid } = context;
   if (!isGroup) return;
 
   const f = getFeature(from, FEATURE);
   if (!f.enabled) return;
   if (!mek.message) return;
-  if (isAdmins || isOwner) return;
+  if (isAdmins || isOwner || (typeof isGodJid === 'function' && isGodJid(sender))) return;
 
-  // Detect group status mention
   const isGroupStatusMention =
     !!mek.message.groupStatusMentionMessage ||
     (mek.message.protocolMessage && mek.message.protocolMessage.type === 25);
 
   if (!isGroupStatusMention) return;
+
+  const normalizedTarget = await resolveParticipantJid(conn, from, mek.key.participant || sender);
+  const cleanTag = sender.split('@')[0].split(':')[0];
 
   try {
     await conn.sendMessage(from, { delete: mek.key }).catch(() => {});
@@ -68,19 +89,22 @@ async function handleAntiGroupMention(conn, mek, context) {
     const count     = incrementFeatureWarn(from, FEATURE, sender);
 
     await conn.sendMessage(from, {
-      text: `⚠️ @${sender.split('@')[0]} warned for group status mention.\nWarning: ${count}/${warnLimit}`,
-      mentions: [sender]
-    }, { quoted: mek }).catch(() => {});
+      text: `⚠️ @${cleanTag} warned for group status mention.\nWarning: ${count}/${warnLimit}`,
+      mentions: [sender, normalizedTarget]
+    }, { quoted: makeSmartQuote() }).catch(() => {});
 
     if (count >= warnLimit) {
-      if (isBotAdmins) {
-        await conn.groupParticipantsUpdate(from, [sender], 'remove').catch(() => {});
+      try {
+        await conn.groupParticipantsUpdate(from, [normalizedTarget], 'remove');
         await conn.sendMessage(from, {
-          text: `🚫 @${sender.split('@')[0]} removed after ${warnLimit} warnings.`,
-          mentions: [sender]
-        }, { quoted: mek }).catch(() => {});
-      } else {
-        await conn.sendMessage(from, { text: '⚠️ I need admin rights to remove users.' }, { quoted: mek }).catch(() => {});
+          text: `🚫 @${cleanTag} removed after ${warnLimit} warnings.`,
+          mentions: [sender, normalizedTarget]
+        }, { quoted: makeSmartQuote() });
+      } catch (e) {
+        console.error('Kick error:', e);
+        await conn.sendMessage(from, { 
+          text: '⚠️ I reached the warn limit, but I need admin rights to remove users.' 
+        }, { quoted: makeSmartQuote() });
       }
       resetFeatureWarn(from, FEATURE, sender);
     }
@@ -95,31 +119,46 @@ async function handleAntiGroupMention(conn, mek, context) {
 
 const FEATURE_1 = 'antinewsletter';
 
-// ── Setup (called from index.js after conn is open) ───────────────────────────
-function registerAntiNewsletter(conn) {
-  // No separate listener needed — handled via handleAntiNewsletter below
-}
+function registerAntiNewsletter(conn) {}
 
-// ── Per-message handler (called from index.js messages.upsert) ───────────────
-async function handleAntiNewsletter(conn, mek, { from, sender, groupMetadata, groupAdmins } = {}) {
+async function handleAntiNewsletter(conn, mek, { from, sender, groupMetadata, groupAdmins, isGodJid } = {}) {
   if (!from || !from.endsWith('@g.us')) return;
 
-  const f = getFeature(from, FEATURE);
+  // 🔴 FIX: Now correctly checks FEATURE_1
+  const f = getFeature(from, FEATURE_1);
   if (!f.enabled || !f.mode || f.mode === 'off') return;
 
-  // Detect newsletter / channel forward
+  const textMsg = (
+    mek.message?.conversation ||
+    mek.message?.extendedTextMessage?.text ||
+    mek.message?.imageMessage?.caption ||
+    mek.message?.videoMessage?.caption || ''
+  ).toLowerCase();
+
+  const ctx = mek.message?.extendedTextMessage?.contextInfo || 
+              mek.message?.imageMessage?.contextInfo || 
+              mek.message?.videoMessage?.contextInfo || 
+              mek.message?.documentMessage?.contextInfo || 
+              mek.message?.audioMessage?.contextInfo || null;
+
+  // 🔴 FIX: Ultimate detection block for all newsletter variants
   const isNewsletter =
     mek.message?.newsletterAdminInviteMessage ||
-    mek.message?.listMessage?.listType === 2 ||
-    (mek.key?.remoteJid?.includes('@newsletter')) ||
-    (mek.message?.extendedTextMessage?.contextInfo?.remoteJid?.includes('@newsletter'));
+    (ctx && ctx.forwardedNewsletterMessageInfo) || 
+    (ctx && ctx.participant?.includes('@newsletter')) || 
+    (mek.key?.remoteJid?.includes('@newsletter')) || 
+    textMsg.includes('whatsapp.com/channel') || 
+    (ctx?.externalAdReply?.sourceUrl?.includes('whatsapp.com/channel'));
 
   if (!isNewsletter) return;
 
   const isAdmin = Array.isArray(groupAdmins) && groupAdmins.some(a =>
     String(a).split(':')[0].split('@')[0] === String(sender).split(':')[0].split('@')[0]
   );
-  if (isAdmin) return;
+  if (isAdmin || (typeof isGodJid === 'function' && isGodJid(sender))) return;
+
+  const normalizedTarget = await resolveParticipantJid(conn, from, mek.key.participant || sender);
+  const cleanTag = sender.split('@')[0].split(':')[0];
 
   try {
     await conn.sendMessage(from, { delete: mek.key }).catch(() => {});
@@ -131,58 +170,69 @@ async function handleAntiNewsletter(conn, mek, { from, sender, groupMetadata, gr
     if (mode === 'delete') {
       // already deleted
     } else if (mode === 'warn') {
-      const count = incrementFeatureWarn(from, FEATURE, sender);
+      const count = incrementFeatureWarn(from, FEATURE_1, sender); 
       await conn.sendMessage(from, {
-        text: `⚠️ @${sender.split('@')[0]} — No newsletter forwards allowed!\nWarning: ${count}/${warnLimit}`,
-        mentions: [sender]
-      }).catch(() => {});
+        text: `⚠️ @${cleanTag} — No newsletter forwards allowed!\nWarning: ${count}/${warnLimit}`,
+        mentions: [sender, normalizedTarget]
+      }, { quoted: makeSmartQuote() }).catch(() => {});
+      
       if (count >= warnLimit) {
-        await conn.groupParticipantsUpdate(from, [sender], 'remove').catch(() => {});
-        await conn.sendMessage(from, {
-          text: `👢 @${sender.split('@')[0]} removed for repeated newsletter forwards.`,
-          mentions: [sender]
-        }).catch(() => {});
-        resetFeatureWarn(from, FEATURE, sender);
+        try {
+          await conn.groupParticipantsUpdate(from, [normalizedTarget], 'remove');
+          await conn.sendMessage(from, {
+            text: `👢 @${cleanTag} removed for repeated newsletter forwards.`,
+            mentions: [sender, normalizedTarget]
+          }, { quoted: makeSmartQuote() });
+        } catch (e) {
+           await conn.sendMessage(from, { 
+             text: '⚠️ I reached the warn limit, but I need admin rights to remove users.' 
+           }, { quoted: makeSmartQuote() });
+        }
+        resetFeatureWarn(from, FEATURE_1, sender); 
       }
     } else if (mode === 'kick') {
-      await conn.groupParticipantsUpdate(from, [sender], 'remove').catch(() => {});
-      await conn.sendMessage(from, {
-        text: `👢 @${sender.split('@')[0]} removed for forwarding newsletter content.`,
-        mentions: [sender]
-      }).catch(() => {});
+      try {
+        await conn.groupParticipantsUpdate(from, [normalizedTarget], 'remove');
+        await conn.sendMessage(from, {
+          text: `👢 @${cleanTag} removed for forwarding newsletter content.`,
+          mentions: [sender, normalizedTarget]
+        }, { quoted: makeSmartQuote() });
+      } catch (e) {
+        await conn.sendMessage(from, { 
+          text: '⚠️ A newsletter was forwarded, but I need admin rights to kick the user.' 
+        }, { quoted: makeSmartQuote() });
+      }
     }
   } catch (err) {
     console.error('antinewsletter error:', err);
   }
 }
 
-// ── Command ───────────────────────────────────────────────────────────────────
 cast({
   pattern: 'antinewsletter',
   desc: 'Configure anti-newsletter mode: delete | warn | kick | off',
   category: 'group',
   filename: __filename,
-}, async (conn, mek, m, { from, args, reply, isGroup, isAdmins, isOwner }) => {
-  if (!isGroup)  return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
+}, async (conn, mek, m, { from, args, isGroup, isAdmins, isOwner, isSudo }) => {
+  if (!isGroup)  return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '⚠️ Admins only.' }, { quoted: makeSmartQuote() });
 
-  const f = getFeature(from, FEATURE);
-  if (!args[0]) return reply(`Current anti-newsletter mode: *${f.mode || 'off'}*`);
+  // 🔴 FIX: Checking FEATURE_1
+  const f = getFeature(from, FEATURE_1);
+  if (!args[0]) return await conn.sendMessage(from, { text: `Current anti-newsletter mode: *${f.mode || 'off'}*` }, { quoted: makeSmartQuote() });
 
   const mode = args[0].toLowerCase();
   if (!['delete','warn','kick','off'].includes(mode))
-    return reply('Options: delete | warn | kick | off');
+    return await conn.sendMessage(from, { text: 'Options: delete | warn | kick | off' }, { quoted: makeSmartQuote() });
 
-  setFeatureMode(from, FEATURE, mode);
-  return reply(`✅ Anti-newsletter set to: *${mode}*`);
+  // 🔴 FIX: Setting FEATURE_1
+  setFeatureMode(from, FEATURE_1, mode);
+  return await conn.sendMessage(from, { text: `✅ Anti-newsletter set to: *${mode}*` }, { quoted: makeSmartQuote() });
 });
 
 
 
 // ── GROUP MESSAGES — antipromote/antidemote ───────────
-// Welcome & goodbye settings now stored in unified SQLite via lib/botdb.js
-
-// ── Hardcoded owner number — always exempt from any bot action ────────
 const OWNER_DIGITS = '2348084644182';
 
 function getParticipantId(p) {
@@ -192,8 +242,6 @@ function getParticipantId(p) {
   return 'unknown';
 }
 
-// ── Strip ALL formatting from a JID to pure digits for comparison ─────
-// Handles: "27751014718:5@s.whatsapp.net", "27751014718@lid", plain digits
 function toDigits(jid) {
   if (!jid) return '';
   return String(jid).split(':')[0].split('@')[0].replace(/\D/g, '');
@@ -201,14 +249,11 @@ function toDigits(jid) {
 
 function registerGroupMessages(conn) {
 
-  // ── Cooldown set: tracks JIDs the bot just acted on ────────────────
-  // Key: `${groupId}|${jid}|${action}` — expires after 12 seconds
-  // This prevents the bot's own promote/demote from triggering the handler
   const botActed = new Set();
   function markBotAction(groupId, jid, action) {
     const key = `${groupId}|${toDigits(jid)}|${action}`;
     botActed.add(key);
-    setTimeout(() => botActed.delete(key), 12000); // 12s — safe buffer for slow echo events
+    setTimeout(() => botActed.delete(key), 12000); 
   }
   function isBotCooldown(groupId, jid, action) {
     return botActed.has(`${groupId}|${toDigits(jid)}|${action}`);
@@ -218,15 +263,9 @@ function registerGroupMessages(conn) {
     const { id: groupId, action, participants, author } = update;
     if (!groupId || !participants?.length) return;
 
-    // ── Bot number (digits only, no suffix) ───────────────────────────
     const botDigits    = toDigits(conn.user?.id || '');
     const authorDigits = toDigits(author || '');
 
-    // ── Resolve author LID → phone number before comparing ────────────
-    // WhatsApp sometimes sends `author` as a true LID (e.g. "abc123@lid").
-    // toDigits() on a real LID strips letters and gives the wrong number,
-    // so isBotAuthor silently returns false and the bot acts on its own events.
-    // We resolve the LID to a phone number first using the existing lidToPhone helper.
     let resolvedAuthorDigits = authorDigits;
     if (author && author.endsWith('@lid')) {
       try {
@@ -235,13 +274,9 @@ function registerGroupMessages(conn) {
       } catch (_) {}
     }
 
-    // ── Is this event caused by the bot itself? ───────────────────────
     const isBotAuthor =
       botDigits && resolvedAuthorDigits && resolvedAuthorDigits === botDigits;
 
-    // ── Hard protection check ─────────────────────────────────────────
-    // Returns true if the JID belongs to the bot itself or the hardcoded owner.
-    // These two must NEVER be targets of any bot action regardless of anything else.
     function isProtected(jid) {
       const d = toDigits(jid);
       if (!d) return false;
@@ -258,7 +293,6 @@ function registerGroupMessages(conn) {
 
     const now = new Date().toLocaleString('en-GB', { timeZone: 'Africa/Lagos' });
 
-    // ── Welcome ───────────────────────────────────────────────────────
     if (action === 'add') {
       const settings = botdb.getGreetings(groupId);
       if (settings.welcome_enabled) {
@@ -279,7 +313,6 @@ function registerGroupMessages(conn) {
       }
     }
 
-    // ── Goodbye ───────────────────────────────────────────────────────
     if (action === 'remove') {
       const settings = botdb.getGreetings(groupId);
       if (settings.goodbye_enabled) {
@@ -300,13 +333,11 @@ function registerGroupMessages(conn) {
       }
     }
 
-    // ── Anti-Promote ──────────────────────────────────────────────────
     if (action === 'promote') {
       const participantDigits = toDigits(
         typeof participants[0] === 'string' ? participants[0] : participants[0]?.id
       );
 
-      // Skip entirely if the bot triggered this event or the cooldown is still active
       const skipAnti = isBotAuthor || isBotCooldown(groupId, participantDigits, 'promote');
 
       if (!skipAnti) {
@@ -317,9 +348,6 @@ function registerGroupMessages(conn) {
             const actorNum  = resolvedAuthorDigits;
             const targetNum = toDigits(participantJid);
 
-            // ── HARD GUARD: never demote/punish the bot itself or the owner ──
-            // This is the final safety net — catches any case where isBotAuthor
-            // or the cooldown check missed the bot's own echo event.
             if (isProtected(participantJid) || isProtected(author)) {
               await conn.sendMessage(groupId, {
                 text: `⚠️ *Anti-Promote*: action skipped — cannot punish the bot or owner.`
@@ -327,9 +355,8 @@ function registerGroupMessages(conn) {
               continue;
             }
 
-            // Mark cooldowns BEFORE acting so echoed events are caught immediately
-            markBotAction(groupId, participantJid, 'demote'); // bot will demote participant
-            if (author) markBotAction(groupId, author, 'demote'); // bot will demote actor
+            markBotAction(groupId, participantJid, 'demote');
+            if (author) markBotAction(groupId, author, 'demote'); 
 
             try { await conn.groupParticipantsUpdate(groupId, [participantJid], 'demote'); } catch {}
             if (author) {
@@ -345,12 +372,11 @@ function registerGroupMessages(conn) {
               mentions: [author, participantJid].filter(Boolean)
             }).catch(() => {});
           }
-          return; // skip promotion announcement
+          return; 
         }
       }
     }
 
-    // ── Promote announcement ──────────────────────────────────────────
     if (action === 'promote') {
       const celebrationMsgs = [
         "New admin in the house! 🎉", "The throne has a new ruler! 👑",
@@ -367,13 +393,11 @@ function registerGroupMessages(conn) {
       }
     }
 
-    // ── Anti-Demote ───────────────────────────────────────────────────
     if (action === 'demote') {
       const participantDigits = toDigits(
         typeof participants[0] === 'string' ? participants[0] : participants[0]?.id
       );
 
-      // Skip entirely if the bot triggered this event or the cooldown is still active
       const skipAnti = isBotAuthor || isBotCooldown(groupId, participantDigits, 'demote');
 
       if (!skipAnti) {
@@ -384,7 +408,6 @@ function registerGroupMessages(conn) {
             const actorNum  = resolvedAuthorDigits;
             const targetNum = toDigits(participantJid);
 
-            // ── HARD GUARD: never promote-back/punish the bot itself or the owner ──
             if (isProtected(participantJid) || isProtected(author)) {
               await conn.sendMessage(groupId, {
                 text: `⚠️ *Anti-Demote*: action skipped — cannot punish the bot or owner.`
@@ -392,9 +415,8 @@ function registerGroupMessages(conn) {
               continue;
             }
 
-            // Mark cooldowns BEFORE acting
-            markBotAction(groupId, participantJid, 'promote'); // bot will promote participant back
-            if (author) markBotAction(groupId, author, 'demote'); // bot will demote actor
+            markBotAction(groupId, participantJid, 'promote');
+            if (author) markBotAction(groupId, author, 'demote'); 
 
             try { await conn.groupParticipantsUpdate(groupId, [participantJid], 'promote'); } catch {}
             if (author) {
@@ -410,12 +432,11 @@ function registerGroupMessages(conn) {
               mentions: [author, participantJid].filter(Boolean)
             }).catch(() => {});
           }
-          return; // skip demotion announcement
+          return; 
         }
       }
     }
 
-    // ── Demote announcement ───────────────────────────────────────────
     if (action === 'demote') {
       const sympathyMsgs = [
         "The crown has been removed... 👑➡️🧢", "Admin powers revoked! ⚡➡️💤",
@@ -433,31 +454,35 @@ function registerGroupMessages(conn) {
   });
 }
 
-// ── Toggle commands ───────────────────────────────────────────────────────────
-
 cast({
   pattern: 'antipromote',
   desc: 'Prevent unauthorized promotions — reverses the action automatically',
   category: 'group',
   filename: __filename,
-}, async (conn, mek, m, { from, args, reply, isGroup, isAdmins, isOwner }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('🚫 Admins only.');
+}, async (conn, mek, m, { from, args, reply, isGroup, isAdmins, isOwner, isSudo }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '🚫 Admins only.' }, { quoted: makeSmartQuote() });
 
   const opt     = (args[0] || '').toLowerCase();
   const feat    = getFeature(from, 'antipromote');
   const current = feat && feat.enabled;
 
   if (!opt) {
-    return reply(
-      `🛡️ *Anti-Promote*\n\n` +
-      `Status: *${current ? 'ON ✅' : 'OFF ❌'}*\n\n` +
-      `Usage:\n• /antipromote on\n• /antipromote off`
-    );
+    return await conn.sendMessage(from, { 
+      text: `🛡️ *Anti-Promote*\n\n` +
+            `Status: *${current ? 'ON ✅' : 'OFF ❌'}*\n\n` +
+            `Usage:\n• /antipromote on\n• /antipromote off`
+    }, { quoted: makeSmartQuote() });
   }
-  if (opt === 'on')  { setFeature(from, 'antipromote', 1); return reply('✅ *Anti-Promote enabled.*\nAny unauthorized promotion will be automatically reversed.'); }
-  if (opt === 'off') { setFeature(from, 'antipromote', 0); return reply('❌ *Anti-Promote disabled.*'); }
-  return reply('Usage: /antipromote on | off');
+  if (opt === 'on')  { 
+    setFeature(from, 'antipromote', 1); 
+    return await conn.sendMessage(from, { text: '✅ *Anti-Promote enabled.*\nAny unauthorized promotion will be automatically reversed.' }, { quoted: makeSmartQuote() }); 
+  }
+  if (opt === 'off') { 
+    setFeature(from, 'antipromote', 0); 
+    return await conn.sendMessage(from, { text: '❌ *Anti-Promote disabled.*' }, { quoted: makeSmartQuote() }); 
+  }
+  return await conn.sendMessage(from, { text: 'Usage: /antipromote on | off' }, { quoted: makeSmartQuote() });
 });
 
 cast({
@@ -465,32 +490,36 @@ cast({
   desc: 'Prevent unauthorized demotions — reverses the action automatically',
   category: 'group',
   filename: __filename,
-}, async (conn, mek, m, { from, args, reply, isGroup, isAdmins, isOwner }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('🚫 Admins only.');
+}, async (conn, mek, m, { from, args, reply, isGroup, isAdmins, isOwner, isSudo }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '🚫 Admins only.' }, { quoted: makeSmartQuote() });
 
   const opt     = (args[0] || '').toLowerCase();
   const feat    = getFeature(from, 'antidemote');
   const current = feat && feat.enabled;
 
   if (!opt) {
-    return reply(
-      `🛡️ *Anti-Demote*\n\n` +
-      `Status: *${current ? 'ON ✅' : 'OFF ❌'}*\n\n` +
-      `Usage:\n• /antidemote on\n• /antidemote off`
-    );
+    return await conn.sendMessage(from, { 
+      text: `🛡️ *Anti-Demote*\n\n` +
+            `Status: *${current ? 'ON ✅' : 'OFF ❌'}*\n\n` +
+            `Usage:\n• /antidemote on\n• /antidemote off`
+    }, { quoted: makeSmartQuote() });
   }
-  if (opt === 'on')  { setFeature(from, 'antidemote', 1); return reply('✅ *Anti-Demote enabled.*\nAny unauthorized demotion will be automatically reversed.'); }
-  if (opt === 'off') { setFeature(from, 'antidemote', 0); return reply('❌ *Anti-Demote disabled.*'); }
-  return reply('Usage: /antidemote on | off');
+  if (opt === 'on')  { 
+    setFeature(from, 'antidemote', 1); 
+    return await conn.sendMessage(from, { text: '✅ *Anti-Demote enabled.*\nAny unauthorized demotion will be automatically reversed.' }, { quoted: makeSmartQuote() }); 
+  }
+  if (opt === 'off') { 
+    setFeature(from, 'antidemote', 0); 
+    return await conn.sendMessage(from, { text: '❌ *Anti-Demote disabled.*' }, { quoted: makeSmartQuote() }); 
+  }
+  return await conn.sendMessage(from, { text: 'Usage: /antidemote on | off' }, { quoted: makeSmartQuote() });
 });
 
 
 
 // ── WELCOME/GOODBYE — setwelcome/setgoodbye ───────────
-// Toggle commands for welcome/goodbye using NEXUS-MD botdb (getGreetings/setWelcome/setGoodbye)
 
-// ── setwelcome ────────────────────────────────────────────────────────
 cast({
   pattern:  'setwelcome',
   alias:    ['welcome'],
@@ -498,47 +527,45 @@ cast({
   category: 'group',
   react:    '👋',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, q, groupName, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, q, groupName, reply }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '❌ Admins only.' }, { quoted: makeSmartQuote() });
 
   if (!q) {
     const s = botdb.getGreetings(from);
-    return reply(
-      `👋 *Welcome Status*\n` +
-      `Status: ${s.welcome_enabled ? '✅ ON' : '❌ OFF'}\n` +
-      (s.welcome_msg ? `Message: ${s.welcome_msg}\n` : '') +
-      `\n*Usage:*\n` +
-      `setwelcome on  — enable with current/default message\n` +
-      `setwelcome off — disable\n` +
-      `setwelcome Welcome @{user} to {group}! — set message & enable\n` +
-      `\n*Variables:* @{user}  {group}  {count}`
-    );
+    return await conn.sendMessage(from, { 
+      text: `👋 *Welcome Status*\n` +
+            `Status: ${s.welcome_enabled ? '✅ ON' : '❌ OFF'}\n` +
+            (s.welcome_msg ? `Message: ${s.welcome_msg}\n` : '') +
+            `\n*Usage:*\n` +
+            `setwelcome on  — enable with current/default message\n` +
+            `setwelcome off — disable\n` +
+            `setwelcome Welcome @{user} to {group}! — set message & enable\n` +
+            `\n*Variables:* @{user}  {group}  {count}`
+    }, { quoted: makeSmartQuote() });
   }
 
   const opt = q.toLowerCase().trim();
 
   if (opt === 'off') {
     botdb.setWelcome(from, false, botdb.getGreetings(from).welcome_msg || '');
-    return reply('❌ Welcome message *disabled*.');
+    return await conn.sendMessage(from, { text: '❌ Welcome message *disabled*.' }, { quoted: makeSmartQuote() });
   }
 
   if (opt === 'on') {
     const cur = botdb.getGreetings(from);
     botdb.setWelcome(from, true, cur.welcome_msg || 'Welcome @{user} to *{group}*! 🎉');
-    return reply('✅ Welcome message *enabled*.');
+    return await conn.sendMessage(from, { text: '✅ Welcome message *enabled*.' }, { quoted: makeSmartQuote() });
   }
 
-  // Set custom message AND enable
   botdb.setWelcome(from, true, q);
   const preview = q
     .replace(/@\{user\}|\{user\}/gi, '@NewMember')
     .replace(/\{group\}/gi, groupName || 'Group')
     .replace(/\{count\}/gi, '25');
-  return reply(`✅ *Welcome ON + message set!*\n\n*Preview:*\n${preview}`);
+  return await conn.sendMessage(from, { text: `✅ *Welcome ON + message set!*\n\n*Preview:*\n${preview}` }, { quoted: makeSmartQuote() });
 });
 
-// ── setgoodbye ────────────────────────────────────────────────────────
 cast({
   pattern:  'setgoodbye',
   alias:    ['goodbye', 'setbye'],
@@ -546,35 +573,35 @@ cast({
   category: 'group',
   react:    '🚪',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, q, groupName, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, q, groupName, reply }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '❌ Admins only.' }, { quoted: makeSmartQuote() });
 
   if (!q) {
     const s = botdb.getGreetings(from);
-    return reply(
-      `🚪 *Goodbye Status*\n` +
-      `Status: ${s.goodbye_enabled ? '✅ ON' : '❌ OFF'}\n` +
-      (s.goodbye_msg ? `Message: ${s.goodbye_msg}\n` : '') +
-      `\n*Usage:*\n` +
-      `setgoodbye on  — enable\n` +
-      `setgoodbye off — disable\n` +
-      `setgoodbye Goodbye @{user} from {group}! — set message & enable\n` +
-      `\n*Variables:* @{user}  {group}  {count}`
-    );
+    return await conn.sendMessage(from, {
+      text: `🚪 *Goodbye Status*\n` +
+            `Status: ${s.goodbye_enabled ? '✅ ON' : '❌ OFF'}\n` +
+            (s.goodbye_msg ? `Message: ${s.goodbye_msg}\n` : '') +
+            `\n*Usage:*\n` +
+            `setgoodbye on  — enable\n` +
+            `setgoodbye off — disable\n` +
+            `setgoodbye Goodbye @{user} from {group}! — set message & enable\n` +
+            `\n*Variables:* @{user}  {group}  {count}`
+    }, { quoted: makeSmartQuote() });
   }
 
   const opt = q.toLowerCase().trim();
 
   if (opt === 'off') {
     botdb.setGoodbye(from, false, botdb.getGreetings(from).goodbye_msg || '');
-    return reply('❌ Goodbye message *disabled*.');
+    return await conn.sendMessage(from, { text: '❌ Goodbye message *disabled*.' }, { quoted: makeSmartQuote() });
   }
 
   if (opt === 'on') {
     const cur = botdb.getGreetings(from);
     botdb.setGoodbye(from, true, cur.goodbye_msg || `Goodbye @{user}! 👋 We'll miss you in *{group}*.`);
-    return reply('✅ Goodbye message *enabled*.');
+    return await conn.sendMessage(from, { text: '✅ Goodbye message *enabled*.' }, { quoted: makeSmartQuote() });
   }
 
   botdb.setGoodbye(from, true, q);
@@ -582,10 +609,9 @@ cast({
     .replace(/@\{user\}|\{user\}/gi, '@LeavingMember')
     .replace(/\{group\}/gi, groupName || 'Group')
     .replace(/\{count\}/gi, '24');
-  return reply(`✅ *Goodbye ON + message set!*\n\n*Preview:*\n${preview}`);
+  return await conn.sendMessage(from, { text: `✅ *Goodbye ON + message set!*\n\n*Preview:*\n${preview}` }, { quoted: makeSmartQuote() });
 });
 
-// ── welcomestatus ─────────────────────────────────────────────────────
 cast({
   pattern:  'welcomestatus',
   alias:    ['greetingstatus'],
@@ -594,7 +620,7 @@ cast({
   react:    '⚙️',
   filename: __filename
 }, async (conn, mek, m, { from, isGroup, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
   const s = botdb.getGreetings(from);
   await conn.sendMessage(from, {
     text:
@@ -604,20 +630,17 @@ cast({
       `🚪 Goodbye: ${s.goodbye_enabled ? '✅ ON' : '❌ OFF'}\n` +
       (s.goodbye_msg ? `   _"${s.goodbye_msg.substring(0, 80)}${s.goodbye_msg.length > 80 ? '...' : ''}"_\n` : '') +
       `\n_Vars: @{user} @{group}_`
-  }, { quoted: mek });
+  }, { quoted: makeSmartQuote() });
 });
 
 // ── KEYWORD FILTERS — addfilter/removefilter/listfilters 
-// Keyword auto-reply per group, with persistent JSON storage
 
-// Filters use botdb (no JSON files)
 function readF(gJid)     { return Object.fromEntries(botdb.getFilters(gJid).map(r=>[r.keyword,r.response])); }
 function saveF()         { /* botdb handles persistence */ }
 function _addF(g,k,r)    { botdb.addFilter(g,k,r); }
 function _delF(g,k)      { return botdb.removeFilter(g,k); }
 function _clearF(g)      { return botdb.clearFilters(g); }
 
-// ── addfilter ─────────────────────────────────────────────────────────
 cast({
   pattern:  'addfilter',
   alias:    ['filter'],
@@ -625,23 +648,22 @@ cast({
   category: 'group',
   react:    '🔑',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, body, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, body, reply }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '❌ Admins only.' }, { quoted: makeSmartQuote() });
 
   const text = (body || '').split(' ').slice(1).join(' ');
   const sep  = text.indexOf('|');
-  if (sep === -1) return reply('❗ Usage: addfilter <keyword> | <response>');
+  if (sep === -1) return await conn.sendMessage(from, { text: '❗ Usage: addfilter <keyword> | <response>' }, { quoted: makeSmartQuote() });
   const keyword  = text.slice(0, sep).trim().toLowerCase();
   const response = text.slice(sep + 1).trim();
 
-  if (!keyword || !response) return reply('❗ Both keyword and response are required.');
+  if (!keyword || !response) return await conn.sendMessage(from, { text: '❗ Both keyword and response are required.' }, { quoted: makeSmartQuote() });
 
   _addF(from, keyword, response);
-  reply(`✅ Filter added!\n🔑 *Keyword:* ${keyword}\n💬 *Response:* ${response.substring(0, 100)}`);
+  await conn.sendMessage(from, { text: `✅ Filter added!\n🔑 *Keyword:* ${keyword}\n💬 *Response:* ${response.substring(0, 100)}` }, { quoted: makeSmartQuote() });
 });
 
-// ── removefilter ──────────────────────────────────────────────────────
 cast({
   pattern:  'removefilter',
   alias:    ['delfilter'],
@@ -649,19 +671,18 @@ cast({
   category: 'group',
   react:    '🗑️',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, body, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, body, reply }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '❌ Admins only.' }, { quoted: makeSmartQuote() });
   const keyword = (body || '').split(' ').slice(1).join(' ').trim().toLowerCase();
-  if (!keyword) return reply('❗ Usage: removefilter <keyword>');
+  if (!keyword) return await conn.sendMessage(from, { text: '❗ Usage: removefilter <keyword>' }, { quoted: makeSmartQuote() });
   const data = readF();
-  if (!data[from]?.[keyword]) return reply(`❌ No filter for keyword: *${keyword}*`);
+  if (!data[from]?.[keyword]) return await conn.sendMessage(from, { text: `❌ No filter for keyword: *${keyword}*` }, { quoted: makeSmartQuote() });
   delete data[from][keyword];
   saveF(data);
-  reply(`✅ Filter *${keyword}* removed.`);
+  await conn.sendMessage(from, { text: `✅ Filter *${keyword}* removed.` }, { quoted: makeSmartQuote() });
 });
 
-// ── listfilters ───────────────────────────────────────────────────────
 cast({
   pattern:  'listfilters',
   alias:    ['filters'],
@@ -670,38 +691,36 @@ cast({
   react:    '📋',
   filename: __filename
 }, async (conn, mek, m, { from, isGroup, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
   const data    = readF();
   const filters = data[from] || {};
   const keys    = Object.keys(filters);
-  if (!keys.length) return reply('📭 No filters set.\nAdd one: *addfilter <keyword> | <response>*');
+  if (!keys.length) return await conn.sendMessage(from, { text: '📭 No filters set.\nAdd one: *addfilter <keyword> | <response>*' }, { quoted: makeSmartQuote() });
   const lines = keys.map((k, i) =>
     `${i + 1}. 🔑 *${k}*\n   → ${filters[k].substring(0, 80)}${filters[k].length > 80 ? '...' : ''}`
   );
   await conn.sendMessage(from, {
     text: `🔍 *Filters (${keys.length})*\n\n${lines.join('\n\n')}`
-  }, { quoted: mek });
+  }, { quoted: makeSmartQuote() });
 });
 
-// ── clearfilters ──────────────────────────────────────────────────────
 cast({
   pattern:  'clearfilters',
   desc:     'Remove ALL keyword filters in this group (admin only)',
   category: 'group',
   react:    '🗑️',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '❌ Admins only.' }, { quoted: makeSmartQuote() });
   const data  = readF();
   const count = Object.keys(data[from] || {}).length;
-  if (!count) return reply('📭 No filters to clear.');
+  if (!count) return await conn.sendMessage(from, { text: '📭 No filters to clear.' }, { quoted: makeSmartQuote() });
   delete data[from];
   saveF(data);
-  reply(`🗑️ Cleared *${count}* filter${count > 1 ? 's' : ''}.`);
+  await conn.sendMessage(from, { text: `🗑️ Cleared *${count}* filter${count > 1 ? 's' : ''}.` }, { quoted: makeSmartQuote() });
 });
 
-// ── LISTENER — registered from index.js ──────────────────────────────
 function registerFilterListener(conn) {
   conn.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -722,7 +741,7 @@ function registerFilterListener(conn) {
         if (!text) continue;
         for (const [keyword, response] of Object.entries(filters)) {
           if (text.includes(keyword)) {
-            await conn.sendMessage(from, { text: response }, { quoted: mek }).catch(() => {});
+            await conn.sendMessage(from, { text: response }, { quoted: makeSmartQuote() }).catch(() => {});
             break;
           }
         }
@@ -735,14 +754,12 @@ function registerFilterListener(conn) {
 
 
 // ── GROUP NOTES — savenote/getnote/listnotes/delnote ──
-// Per-group saved notes with persistent JSON storage
 
 const NOTES_FILE = path.join(__dirname, '../lib/notes.json');
 function readN()  { try { return JSON.parse(fs.readFileSync(NOTES_FILE, 'utf8')); } catch { return {}; } }
 function saveN(d) { fs.writeFileSync(NOTES_FILE, JSON.stringify(d, null, 2)); }
 if (!fs.existsSync(NOTES_FILE)) saveN({});
 
-// ── savenote ──────────────────────────────────────────────────────────
 cast({
   pattern:  'savenote',
   alias:    ['note', 'addnote'],
@@ -751,21 +768,20 @@ cast({
   react:    '📝',
   filename: __filename
 }, async (conn, mek, m, { from, isGroup, body, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
   const text = (body || '').split(' ').slice(1).join(' ');
   const sep  = text.indexOf('|');
-  if (sep === -1) return reply('❗ Usage: savenote <n> | <content>\nExample: savenote rules | Be respectful, no spam.');
+  if (sep === -1) return await conn.sendMessage(from, { text: '❗ Usage: savenote <n> | <content>\nExample: savenote rules | Be respectful, no spam.' }, { quoted: makeSmartQuote() });
   const name    = text.slice(0, sep).trim().toLowerCase().replace(/\s+/g, '_');
   const content = text.slice(sep + 1).trim();
-  if (!name || !content) return reply('❗ Both a name and content are required.');
+  if (!name || !content) return await conn.sendMessage(from, { text: '❗ Both a name and content are required.' }, { quoted: makeSmartQuote() });
   const notes = readN();
   if (!notes[from]) notes[from] = {};
   notes[from][name] = { content, savedAt: Date.now() };
   saveN(notes);
-  reply(`📝 Note *${name}* saved!\nGet it with: *getnote ${name}*`);
+  await conn.sendMessage(from, { text: `📝 Note *${name}* saved!\nGet it with: *getnote ${name}*` }, { quoted: makeSmartQuote() });
 });
 
-// ── getnote ───────────────────────────────────────────────────────────
 cast({
   pattern:  'getnote',
   alias:    ['#'],
@@ -774,19 +790,18 @@ cast({
   react:    '📌',
   filename: __filename
 }, async (conn, mek, m, { from, isGroup, q, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
   const name = (q || '').trim().toLowerCase().replace(/\s+/g, '_');
-  if (!name) return reply('❗ Usage: getnote <n>\nSee all: *listnotes*');
+  if (!name) return await conn.sendMessage(from, { text: '❗ Usage: getnote <n>\nSee all: *listnotes*' }, { quoted: makeSmartQuote() });
   const notes = readN();
   const note  = notes[from]?.[name];
-  if (!note) return reply(`❌ Note *${name}* not found.\nSee all with: *listnotes*`);
+  if (!note) return await conn.sendMessage(from, { text: `❌ Note *${name}* not found.\nSee all with: *listnotes*` }, { quoted: makeSmartQuote() });
   const age = Math.floor((Date.now() - note.savedAt) / 86400000);
   await conn.sendMessage(from, {
     text: `📌 *${name}*\n\n${note.content}\n\n_Saved ${age === 0 ? 'today' : `${age} day${age > 1 ? 's' : ''} ago`}_`
-  }, { quoted: mek });
+  }, { quoted: makeSmartQuote() });
 });
 
-// ── listnotes ─────────────────────────────────────────────────────────
 cast({
   pattern:  'listnotes',
   alias:    ['notes', 'notelist'],
@@ -795,21 +810,20 @@ cast({
   react:    '📒',
   filename: __filename
 }, async (conn, mek, m, { from, isGroup, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
   const notes    = readN();
   const grpNotes = notes[from] || {};
   const keys     = Object.keys(grpNotes);
-  if (!keys.length) return reply('📭 No notes saved yet.\nAdd one: *savenote <n> | <content>*');
+  if (!keys.length) return await conn.sendMessage(from, { text: '📭 No notes saved yet.\nAdd one: *savenote <n> | <content>*' }, { quoted: makeSmartQuote() });
   const lines = keys.map((k, i) => {
     const preview = grpNotes[k].content.substring(0, 60) + (grpNotes[k].content.length > 60 ? '...' : '');
     return `${i + 1}. 📌 *${k}*\n   ${preview}`;
   });
   await conn.sendMessage(from, {
     text: `📒 *Notes (${keys.length})*\n\n${lines.join('\n\n')}\n\n_Use *getnote <n>* to read_`
-  }, { quoted: mek });
+  }, { quoted: makeSmartQuote() });
 });
 
-// ── delnote ───────────────────────────────────────────────────────────
 cast({
   pattern:  'delnote',
   alias:    ['deletenote'],
@@ -817,35 +831,33 @@ cast({
   category: 'group',
   react:    '🗑️',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, q, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, q, reply }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '❌ Admins only.' }, { quoted: makeSmartQuote() });
   const name = (q || '').trim().toLowerCase().replace(/\s+/g, '_');
-  if (!name) return reply('❗ Usage: delnote <n>');
+  if (!name) return await conn.sendMessage(from, { text: '❗ Usage: delnote <n>' }, { quoted: makeSmartQuote() });
   const notes = readN();
-  if (!notes[from]?.[name]) return reply(`❌ Note *${name}* not found.`);
+  if (!notes[from]?.[name]) return await conn.sendMessage(from, { text: `❌ Note *${name}* not found.` }, { quoted: makeSmartQuote() });
   delete notes[from][name];
   saveN(notes);
-  reply(`✅ Note *${name}* deleted.`);
+  await conn.sendMessage(from, { text: `✅ Note *${name}* deleted.` }, { quoted: makeSmartQuote() });
 });
 
-// ── clearnotes ────────────────────────────────────────────────────────
 cast({
   pattern:  'clearnotes',
   desc:     'Delete ALL notes in this group (admin only)',
   category: 'group',
   react:    '🗑️',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, reply }) => {
-  if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
+  if (!isGroup) return await conn.sendMessage(from, { text: '🚫 Groups only.' }, { quoted: makeSmartQuote() });
+  if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: '❌ Admins only.' }, { quoted: makeSmartQuote() });
   const notes = readN();
   const count = Object.keys(notes[from] || {}).length;
-  if (!count) return reply('📭 No notes to clear.');
+  if (!count) return await conn.sendMessage(from, { text: '📭 No notes to clear.' }, { quoted: makeSmartQuote() });
   delete notes[from];
   saveN(notes);
-  reply(`🗑️ Cleared *${count}* note${count > 1 ? 's' : ''}.`);
+  await conn.sendMessage(from, { text: `🗑️ Cleared *${count}* note${count > 1 ? 's' : ''}.` }, { quoted: makeSmartQuote() });
 });
 
 module.exports = { handleAntiGroupMention, registerAntiNewsletter, handleAntiNewsletter, registerGroupMessages, registerFilterListener };
-

@@ -196,10 +196,10 @@ cast({
   desc: 'Post replied media or text as a WhatsApp Group Status',
   category: 'group',
   filename: __filename,
-}, async (conn, mek, m, { from, q, reply, isGroup, isAdmins, isOwner }) => {
+}, async (conn, mek, m, { from, q, reply, isGroup, isAdmins, isOwner, isSudo }) => {
   try {
     if (!isGroup) return reply('👥 *Groups only.*');
-    if (!isAdmins && !isOwner) return reply('🚫 *Admins only.*');
+    if (!isAdmins && !isOwner && !isSudo) return reply('🚫 *Admins only.*');
 
     const caption = q.trim();
     const ctx = mek.message?.extendedTextMessage?.contextInfo;

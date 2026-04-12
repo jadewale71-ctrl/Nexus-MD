@@ -1,8 +1,8 @@
 'use strict';
-
 const { cast, makeSmartQuote, applyFont } = require('../cast');
+
 const { jidNormalizedUser } = require("@whiskeysockets/baileys");
-const { lidToPhone, resolveJidDisplay } = require("../lib/lid");
+const { lidToPhone } = require("../lib/lid");
 const axios = require("axios");
 
 // ─────────────────────────────────────────────────────────────────────
@@ -62,6 +62,14 @@ const resolveTarget = async (conn, m, mek, args, q, participants) => {
   try { return jidNormalizedUser(target); } catch { return target; }
 };
 
+// Get a display name for a JID from group participants list
+const getDisplayName = (jid, participants) => {
+  const digitsOnly = short(jid);
+  // participants may have verifiedName or name
+  const p = (participants || []).find(x => short(x.id) === digitsOnly);
+  return p?.verifiedName || p?.name || p?.notify || digitsOnly;
+};
+
 // ─────────────────────────────────────────────────────────────────────
 // SCHEDULE STORE  (in-memory, survives plugin reloads within same process)
 // ─────────────────────────────────────────────────────────────────────
@@ -78,10 +86,12 @@ function clearSchedule(jid) {
   }
 }
 
-// Parse user input
+// Parse user input — supports "19:00" (daily cron) or "30min" / "2h" (one-shot delay)
+// Returns { type: 'cron'|'delay', value: cronString|ms, label: humanReadable }
 function parseTimeInput(input) {
   const str = input.trim().toLowerCase();
 
+  // Duration: 30min, 2h, 90s
   const minMatch = str.match(/^(\d+)\s*min$/);
   const hrMatch  = str.match(/^(\d+)\s*h(r|ours?)?$/);
   const secMatch  = str.match(/^(\d+)\s*s(ec|econds?)?$/);
@@ -89,6 +99,7 @@ function parseTimeInput(input) {
   if (hrMatch)  return { type: 'delay', value: parseInt(hrMatch[1])  * 3600000, label: `${hrMatch[1]} hour(s)` };
   if (secMatch) return { type: 'delay', value: parseInt(secMatch[1]) * 1000,    label: `${secMatch[1]} second(s)` };
 
+  // Time: 19:00 or 7:00pm or 19:00
   const timeMatch = str.match(/^(\d{1,2}):(\d{2})\s*(am|pm)?$/);
   if (timeMatch) {
     let h = parseInt(timeMatch[1]);
@@ -96,10 +107,12 @@ function parseTimeInput(input) {
     const ampm = timeMatch[3];
     if (ampm === 'pm' && h < 12) h += 12;
     if (ampm === 'am' && h === 12) h = 0;
+    // Build cron: "MM HH * * *"
     const cronStr = `${min} ${h} * * *`;
     const label = `${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')} daily`;
     return { type: 'cron', value: cronStr, label };
   }
+
   return null;
 }
 
@@ -112,23 +125,23 @@ cast({
   desc: "Kicks a member from the group",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, args, q, isGroup, isAdmins, isOwner, isSudo, isGodJid, participants }) => {
+}, async (conn, mek, m, { from, args, q, reply, isGroup, isAdmins, isOwner, participants }) => {
   try {
-    if (!isGroup) return await conn.sendMessage(from, { text: "🚫 *Groups only!*" }, { quoted: makeSmartQuote() });
-    if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: "⚠️ *You need admin permissions.*" }, { quoted: makeSmartQuote() });
+    if (!isGroup) return reply("🚫 *Groups only!*");
+    if (!isAdmins && !isOwner) return reply("⚠️ *You need admin permissions.*");
 
     const target = await resolveTarget(conn, m, mek, args, q, participants);
-    if (!target) return await conn.sendMessage(from, { text: "_Tag a user, reply to their message, or type their number._" }, { quoted: makeSmartQuote() });
-    if (isGodJid(target)) return await conn.sendMessage(from, { text: "😂 *I'm not kicking my creator!*" }, { quoted: makeSmartQuote() });
+    if (!target) return reply("_Tag a user, reply to their message, or type their number (e.g. /kick 2348012345678)._");
+    if (target.includes("2348084644182")) return reply("😂 *I'm not kicking my creator!*");
 
-    const name = await resolveJidDisplay(conn, target, participants);
+    const name = getDisplayName(target, participants);
     await conn.groupParticipantsUpdate(from, [target], "remove");
-    return await conn.sendMessage(from, {
+    return conn.sendMessage(from, {
       text: `👢 *${name}* has been removed from the group.`,
       mentions: [target]
-    }, { quoted: makeSmartQuote() });
+    }, { quoted: mek });
   } catch (e) {
-    await conn.sendMessage(from, { text: "❌ *Failed to kick.* I may need admin rights in this group." }, { quoted: makeSmartQuote() });
+    reply("❌ *Failed to kick.* I may need admin rights in this group.");
   }
 });
 
@@ -137,22 +150,21 @@ cast({
   desc: "Adds a person to the group",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, args, q, isGroup, isAdmins, isOwner, isSudo, participants }) => {
+}, async (conn, mek, m, { from, args, q, reply, isGroup, isAdmins, isOwner }) => {
   try {
-    if (!isGroup) return await conn.sendMessage(from, { text: "🚫 *Groups only!*" }, { quoted: makeSmartQuote() });
-    if (!isAdmins && !isOwner && !isSudo) return await conn.sendMessage(from, { text: "⚠️ *Admin only.*" }, { quoted: makeSmartQuote() });
+    if (!isGroup) return reply("🚫 *Groups only!*");
+    if (!isAdmins && !isOwner) return reply("⚠️ *Admin only.*");
 
     const target = await resolveTarget(conn, m, mek, args, q);
-    if (!target) return await conn.sendMessage(from, { text: "_Type a number to add._" }, { quoted: makeSmartQuote() });
+    if (!target) return reply("_Type a number to add (e.g. /add 2348012345678)._");
 
-    const name = await resolveJidDisplay(conn, target, participants);
     await conn.groupParticipantsUpdate(from, [target], "add");
-    return await conn.sendMessage(from, {
-      text: `✅ *${name}* has been added to the group!`,
+    return conn.sendMessage(from, {
+      text: `✅ @${short(target)} *has been added to the group!*`,
       mentions: [target]
-    }, { quoted: makeSmartQuote() });
+    }, { quoted: mek });
   } catch (e) {
-    await conn.sendMessage(from, { text: "❌ *Failed to add.* User may have privacy settings or I need admin rights." }, { quoted: makeSmartQuote() });
+    reply("❌ *Failed to add.* User may have privacy settings or I need admin rights.");
   }
 });
 
@@ -161,22 +173,20 @@ cast({
   desc: "Promotes a member to admin",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, args, q, isGroup, isAdmins, isOwner, isSudo, participants }) => {
+}, async (conn, mek, m, { from, args, q, reply, isGroup, isAdmins, isOwner, participants }) => {
   try {
-    if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
+    if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
 
     const target = await resolveTarget(conn, m, mek, args, q, participants);
-    if (!target) return await conn.sendMessage(from, { text: "_Tag someone or type their number to promote._" }, { quoted: makeSmartQuote() });
+    if (!target) return reply("_Tag someone or type their number to promote._");
 
-    const name = await resolveJidDisplay(conn, target, participants);
+    const name = getDisplayName(target, participants);
     await conn.groupParticipantsUpdate(from, [target], "promote");
-    return await conn.sendMessage(from, {
+    return conn.sendMessage(from, {
       text: `⭐ *${name}* has been promoted to admin!`,
       mentions: [target]
-    }, { quoted: makeSmartQuote() });
-  } catch (e) { 
-    await conn.sendMessage(from, { text: "❌ *Failed to promote.* I may need admin rights." }, { quoted: makeSmartQuote() }); 
-  }
+    }, { quoted: mek });
+  } catch (e) { reply("❌ *Failed to promote.* I may need admin rights."); }
 });
 
 cast({
@@ -184,22 +194,20 @@ cast({
   desc: "Demotes an admin to member",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, args, q, isGroup, isAdmins, isOwner, isSudo, participants }) => {
+}, async (conn, mek, m, { from, args, q, reply, isGroup, isAdmins, isOwner, participants }) => {
   try {
-    if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
+    if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
 
     const target = await resolveTarget(conn, m, mek, args, q, participants);
-    if (!target) return await conn.sendMessage(from, { text: "_Tag someone or type their number to demote._" }, { quoted: makeSmartQuote() });
+    if (!target) return reply("_Tag someone or type their number to demote._");
 
-    const name = await resolveJidDisplay(conn, target, participants);
+    const name = getDisplayName(target, participants);
     await conn.groupParticipantsUpdate(from, [target], "demote");
-    return await conn.sendMessage(from, {
+    return conn.sendMessage(from, {
       text: `📉 *${name}* has been demoted to member.`,
       mentions: [target]
-    }, { quoted: makeSmartQuote() });
-  } catch (e) { 
-    await conn.sendMessage(from, { text: "❌ *Failed to demote.* I may need admin rights." }, { quoted: makeSmartQuote() }); 
-  }
+    }, { quoted: mek });
+  } catch (e) { reply("❌ *Failed to demote.* I may need admin rights."); }
 });
 
 // ─────────────────────────────────────────────────────────────────────
@@ -212,40 +220,46 @@ cast({
   desc: "Mentions everyone in the group",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, isGroup, groupMetadata, groupName, sender, q, isAdmins, isOwner, isSudo }) => {
+}, async (conn, mek, m, { from, reply, isGroup, groupMetadata, groupName, sender, q, isAdmins, isOwner }) => {
   try {
-    if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
+    if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
 
     const participants = groupMetadata.participants || [];
-    const mentions    = participants.map(p => p.id);
-    const admins      = participants.filter(p => p.admin).map(p => p.id);
-    const members     = participants.filter(p => !p.admin).map(p => p.id);
-    const message     = q || "📢 Attention everyone!";
-    const now         = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+    const mentions = participants.map((p) => p.id);
+    const admins = participants.filter(p => p.admin).map(p => p.id);
+    const members = participants.filter(p => !p.admin).map(p => p.id);
+    const message = q || "📢 Attention everyone!";
+    const now = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
 
-    let text = `┏◈ ≺ *NEXUS-MD* ≻ ◈\n`;
-    text += `┃ *ɢʀᴏᴜᴘ* : ${groupName || 'Unknown'}\n`;
-    text += `┃ *ʙʏ* : @${short(sender)}\n`;
-    text += `┃ *ᴛɪᴍᴇ* : ${now}\n`;
-    text += `┃ *ᴛᴏᴛᴀʟ* : ${participants.length} (${admins.length} admins, ${members.length} members)\n`;
-    text += `┃ *ᴍsɢ* : ${message}\n`;
-    text += `┗◈\n\n`;
+    let text = `┏━━━━━━━━━━━━━━━━━━━━┓\n`;
+    text += `┃  👑 *NEXUS-MD TAGALL* 👑\n`;
+    text += `┗━━━━━━━━━━━━━━━━━━━━┛\n\n`;
+    text += `📌 *Group:* ${groupName || 'Unknown'}\n`;
+    text += `👤 *By:* @${short(sender)}\n`;
+    text += `🕐 *Time:* ${now}\n`;
+    text += `📊 *Members:* ${participants.length} (${admins.length} admins)\n\n`;
+    text += `💬 *Message:*\n${message}\n\n`;
 
     if (admins.length > 0) {
-      text += `┏◈ ≺ *ADMINS* ≻\n`;
-      admins.forEach(jid => { text += `┃⇒ @${short(jid)}\n`; });
-      text += `┗◈\n\n`;
+      text += `━━━━ 👑 *ADMINS* ━━━━\n`;
+      admins.forEach(jid => { text += `  ┣ @${short(jid)}\n`; });
+      text += `\n`;
     }
 
-    text += `┏◈ ≺ *MEMBERS* ≻\n`;
-    members.forEach(jid => { text += `┃⇒ @${short(jid)}\n`; });
-    text += `┗◈`;
+    text += `━━━━ 👥 *MEMBERS* ━━━━\n`;
+    members.forEach(jid => { text += `  ┣ @${short(jid)}\n`; });
+    text += `\n┗━━━━━━━━━━━━━━━━━━━━┛`;
 
-    return await conn.sendMessage(from, { text, mentions }, { quoted: makeSmartQuote() });
-  } catch (e) { 
-    await conn.sendMessage(from, { text: `❌ Error: ${e.message}` }, { quoted: makeSmartQuote() }); 
-  }
+    return await conn.sendMessage(from, { text, mentions }, { quoted: mek });
+  } catch (e) { reply(`❌ Error: ${e.message}`); }
 });
+
+
+// ─────────────────────────────────────────────────────────────────────
+// TAG — mention specific user with optional message.
+// If the body/quoted contains a WhatsApp group invite link,
+// fetches the group DP and sends it as an image with the tag.
+// ─────────────────────────────────────────────────────────────────────
 
 
 // ─────────────────────────────────────────────────────────────────────
@@ -258,39 +272,40 @@ cast({
   desc: "Schedule group to open at a time or after a delay. e.g. /scheduleopen 19:00 or /scheduleopen 30min",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, q, isGroup, isAdmins, isOwner, isSudo }) => {
-  if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
-  if (!q) return await conn.sendMessage(from, { 
-    text: `*⏰ Schedule Group Open*\n\n` +
-          `Usage:\n` +
-          `• \`/scheduleopen 19:00\` — open daily at 7 PM\n` +
-          `• \`/scheduleopen 30min\` — open after 30 minutes\n` +
-          `• \`/scheduleopen 2h\` — open after 2 hours` 
-  }, { quoted: makeSmartQuote() });
+}, async (conn, mek, m, { from, q, reply, isGroup, isAdmins, isOwner }) => {
+  if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
+  if (!q) return reply(
+    `*⏰ Schedule Group Open*\n\n` +
+    `Usage:\n` +
+    `• \`/scheduleopen 19:00\` — open daily at 7 PM\n` +
+    `• \`/scheduleopen 30min\` — open after 30 minutes\n` +
+    `• \`/scheduleopen 2h\` — open after 2 hours`
+  );
 
   const parsed = parseTimeInput(q);
-  if (!parsed) return await conn.sendMessage(from, { text: "❌ Invalid format. Use `19:00`, `30min`, or `2h`." }, { quoted: makeSmartQuote() });
+  if (!parsed) return reply("❌ Invalid format. Use `19:00`, `30min`, or `2h`.");
 
   if (parsed.type === 'delay') {
     const timer = setTimeout(async () => {
       try {
         await conn.groupSettingUpdate(from, "not_announcement");
-        // Removed smart quote here so it doesn't quote a random future message!
-        await conn.sendMessage(from, { text: `🔓 *Group is now open!*\nEveryone can send messages.` });
+        await conn.sendMessage(from, { text: `🔓 *Group is now open!*\nEveryone can send messages.` }, { quoted: mek });
       } catch {}
     }, parsed.value);
 
+    // Store timer
     const existing = global._gcSchedules.get(from) || {};
     if (existing.openTimer) clearTimeout(existing.openTimer);
     existing.openTimer = timer;
     global._gcSchedules.set(from, existing);
 
-    return await conn.sendMessage(from, { text: `✅ *Group open scheduled!*\nWill open in *${parsed.label}*.` }, { quoted: makeSmartQuote() });
+    return reply(`✅ *Group open scheduled!*\nWill open in *${parsed.label}*.`);
 
   } else {
+    // Cron
     let cron;
-    try { cron = require('node-cron'); } catch { return await conn.sendMessage(from, { text: "❌ node-cron not installed." }, { quoted: makeSmartQuote() }); }
-    if (!cron.validate(parsed.value)) return await conn.sendMessage(from, { text: "❌ Invalid time format." }, { quoted: makeSmartQuote() });
+    try { cron = require('node-cron'); } catch { return reply("❌ node-cron not installed."); }
+    if (!cron.validate(parsed.value)) return reply("❌ Invalid time format.");
 
     const existing = global._gcSchedules.get(from) || {};
     if (existing.openJob) try { existing.openJob.stop(); } catch {}
@@ -298,13 +313,12 @@ cast({
     existing.openJob = cron.schedule(parsed.value, async () => {
       try {
         await conn.groupSettingUpdate(from, "not_announcement");
-        // Removed smart quote here!
-        await conn.sendMessage(from, { text: `🔓 *Group is now open!* _(Scheduled)_` });
+        await conn.sendMessage(from, { text: `🔓 *Group is now open!* _(Scheduled)_` }, { quoted: mek });
       } catch {}
     }, { scheduled: true, timezone: "Africa/Lagos" });
 
     global._gcSchedules.set(from, existing);
-    return await conn.sendMessage(from, { text: `✅ *Group open scheduled daily at ${parsed.label}!*\nUse /cancelschedule to remove.` }, { quoted: makeSmartQuote() });
+    return reply(`✅ *Group open scheduled daily at ${parsed.label}!*\nUse /cancelschedule to remove.`);
   }
 });
 
@@ -314,25 +328,24 @@ cast({
   desc: "Schedule group to close at a time or after a delay. e.g. /scheduleclose 23:00 or /scheduleclose 1h",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, q, isGroup, isAdmins, isOwner, isSudo }) => {
-  if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
-  if (!q) return await conn.sendMessage(from, { 
-    text: `*⏰ Schedule Group Close*\n\n` +
-          `Usage:\n` +
-          `• \`/scheduleclose 23:00\` — close daily at 11 PM\n` +
-          `• \`/scheduleclose 30min\` — close after 30 minutes\n` +
-          `• \`/scheduleclose 2h\` — close after 2 hours` 
-  }, { quoted: makeSmartQuote() });
+}, async (conn, mek, m, { from, q, reply, isGroup, isAdmins, isOwner }) => {
+  if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
+  if (!q) return reply(
+    `*⏰ Schedule Group Close*\n\n` +
+    `Usage:\n` +
+    `• \`/scheduleclose 23:00\` — close daily at 11 PM\n` +
+    `• \`/scheduleclose 30min\` — close after 30 minutes\n` +
+    `• \`/scheduleclose 2h\` — close after 2 hours`
+  );
 
   const parsed = parseTimeInput(q);
-  if (!parsed) return await conn.sendMessage(from, { text: "❌ Invalid format. Use `23:00`, `30min`, or `2h`." }, { quoted: makeSmartQuote() });
+  if (!parsed) return reply("❌ Invalid format. Use `23:00`, `30min`, or `2h`.");
 
   if (parsed.type === 'delay') {
     const timer = setTimeout(async () => {
       try {
         await conn.groupSettingUpdate(from, "announcement");
-        // Removed smart quote here!
-        await conn.sendMessage(from, { text: `🔒 *Group is now closed!*\nOnly admins can send messages.` });
+        await conn.sendMessage(from, { text: `🔒 *Group is now closed!*\nOnly admins can send messages.` }, { quoted: mek });
       } catch {}
     }, parsed.value);
 
@@ -341,12 +354,12 @@ cast({
     existing.closeTimer = timer;
     global._gcSchedules.set(from, existing);
 
-    return await conn.sendMessage(from, { text: `✅ *Group close scheduled!*\nWill close in *${parsed.label}*.` }, { quoted: makeSmartQuote() });
+    return reply(`✅ *Group close scheduled!*\nWill close in *${parsed.label}*.`);
 
   } else {
     let cron;
-    try { cron = require('node-cron'); } catch { return await conn.sendMessage(from, { text: "❌ node-cron not installed." }, { quoted: makeSmartQuote() }); }
-    if (!cron.validate(parsed.value)) return await conn.sendMessage(from, { text: "❌ Invalid time format." }, { quoted: makeSmartQuote() });
+    try { cron = require('node-cron'); } catch { return reply("❌ node-cron not installed."); }
+    if (!cron.validate(parsed.value)) return reply("❌ Invalid time format.");
 
     const existing = global._gcSchedules.get(from) || {};
     if (existing.closeJob) try { existing.closeJob.stop(); } catch {}
@@ -354,13 +367,12 @@ cast({
     existing.closeJob = cron.schedule(parsed.value, async () => {
       try {
         await conn.groupSettingUpdate(from, "announcement");
-        // Removed smart quote here!
-        await conn.sendMessage(from, { text: `🔒 *Group is now closed!* _(Scheduled)_` });
+        await conn.sendMessage(from, { text: `🔒 *Group is now closed!* _(Scheduled)_` }, { quoted: mek });
       } catch {}
     }, { scheduled: true, timezone: "Africa/Lagos" });
 
     global._gcSchedules.set(from, existing);
-    return await conn.sendMessage(from, { text: `✅ *Group close scheduled daily at ${parsed.label}!*\nUse /cancelschedule to remove.` }, { quoted: makeSmartQuote() });
+    return reply(`✅ *Group close scheduled daily at ${parsed.label}!*\nUse /cancelschedule to remove.`);
   }
 });
 
@@ -370,11 +382,11 @@ cast({
   desc: "Cancel all scheduled open/close for this group",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo }) => {
-  if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
-  if (!global._gcSchedules.has(from)) return await conn.sendMessage(from, { text: "ℹ️ No schedule is set for this group." }, { quoted: makeSmartQuote() });
+}, async (conn, mek, m, { from, reply, isGroup, isAdmins, isOwner }) => {
+  if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
+  if (!global._gcSchedules.has(from)) return reply("ℹ️ No schedule is set for this group.");
   clearSchedule(from);
-  return await conn.sendMessage(from, { text: "🗑️ *All schedules for this group have been cancelled.*" }, { quoted: makeSmartQuote() });
+  return reply("🗑️ *All schedules for this group have been cancelled.*");
 });
 
 cast({
@@ -383,15 +395,15 @@ cast({
   desc: "Check if a schedule is active for this group",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo }) => {
-  if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
+}, async (conn, mek, m, { from, reply, isGroup, isAdmins, isOwner }) => {
+  if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
   const s = global._gcSchedules.get(from);
-  if (!s) return await conn.sendMessage(from, { text: "ℹ️ *No active schedule* for this group." }, { quoted: makeSmartQuote() });
+  if (!s) return reply("ℹ️ *No active schedule* for this group.");
   const lines = [`⏰ *Active Schedules:*\n`];
   if (s.openJob || s.openTimer) lines.push(`✅ Open: *set*`);
   if (s.closeJob || s.closeTimer) lines.push(`✅ Close: *set*`);
   lines.push(`\nUse /cancelschedule to remove.`);
-  return await conn.sendMessage(from, { text: lines.join('\n') }, { quoted: makeSmartQuote() });
+  return reply(lines.join('\n'));
 });
 
 // ─────────────────────────────────────────────────────────────────────
@@ -403,14 +415,12 @@ cast({
   desc: "Mutes the group (only admins can send)",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo }) => {
-  if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
+}, async (conn, mek, m, { from, reply, isGroup, isAdmins, isOwner }) => {
+  if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
   try {
     await conn.groupSettingUpdate(from, "announcement");
-    await conn.sendMessage(from, { text: "🔇 *Group muted.* Only admins can send messages." }, { quoted: makeSmartQuote() });
-  } catch (e) { 
-    await conn.sendMessage(from, { text: "❌ Failed. I may need admin rights." }, { quoted: makeSmartQuote() }); 
-  }
+    reply("🔇 *Group muted.* Only admins can send messages.");
+  } catch (e) { reply("❌ Failed. I may need admin rights."); }
 });
 
 cast({
@@ -418,12 +428,10 @@ cast({
   desc: "Unmutes the group",
   category: "group",
   filename: __filename,
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo }) => {
-  if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return await conn.sendMessage(from, { text: "🚫 *Admins only.*" }, { quoted: makeSmartQuote() });
+}, async (conn, mek, m, { from, reply, isGroup, isAdmins, isOwner }) => {
+  if (!isGroup || (!isAdmins && !isOwner)) return reply("🚫 *Admins only.*");
   try {
     await conn.groupSettingUpdate(from, "not_announcement");
-    await conn.sendMessage(from, { text: "🔊 *Group unmuted.* Everyone can send messages." }, { quoted: makeSmartQuote() });
-  } catch (e) { 
-    await conn.sendMessage(from, { text: "❌ Failed. I may need admin rights." }, { quoted: makeSmartQuote() }); 
-  }
+    reply("🔊 *Group unmuted.* Everyone can send messages.");
+  } catch (e) { reply("❌ Failed. I may need admin rights."); }
 });

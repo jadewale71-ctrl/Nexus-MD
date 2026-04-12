@@ -6,53 +6,49 @@ const { getFeature, setFeature,
         incrementFeatureWarn,
         resetFeatureWarn,
         getGroupSettings }             = require('../lib/botdb');
-const config = require('../config');
 
 const FEATURE = 'antibot';
 
-// ── Bot detection ─────────────────────────────────────────────────────────────
-// Bot frameworks (Baileys, XYLO etc.) stamp their OUTGOING message IDs with
-// known prefixes. A human typing :ping has a normal WhatsApp message ID.
-// Big Daddy replying "Pong! 430ms" has a 3EB0... ID — that's the bot.
-// We check the message ID of whatever was SENT by this participant.
-function isBotMessage(mek, botNumber, ownerNumbers = []) {
-  const msgId     = (mek?.key?.id || '').toUpperCase();
-  const sender    = mek?.key?.participant || mek?.key?.remoteJid || '';
-  const senderNum = sender.split('@')[0].split(':')[0].replace(/\D/g, '');
+// ── Bot detection — checks multiple signals ───────────────────────────────────
+function isBotMessage(mek) {
+  const msgId  = mek?.key?.id || '';
+  const sender = mek?.key?.participant || mek?.key?.remoteJid || '';
 
-  // Never flag our own bot
-  if (botNumber && senderNum === String(botNumber).replace(/\D/g, '')) return false;
+  // 1. Known bot message ID prefixes (Baileys/WA-multi-device bots)
+  const botIdPrefixes = ['3EB0', 'FALSE', 'TRUE', 'BAE5', 'NEXUS', 'BOT'];
+  if (botIdPrefixes.some(p => msgId.toUpperCase().startsWith(p))) return true;
 
-  // Never flag owner numbers
-  if (ownerNumbers.some(o => String(o).replace(/\D/g, '') === senderNum)) return false;
-
-  // Known bot framework message ID prefixes
-  const botIdPrefixes = [
-    '3EB0',   // Baileys standard
-    'BAE5',   // older Baileys
-    'FALSE',  // WA-Multi-Device legacy
-    'TRUE',   // WA-Multi-Device legacy
-    'XYLO',   // XYLO-MD (modified Baileys)
-    'CYPHER', // Cypher-X
-    'WBOT',
-    'MBOT',
-  ];
-  if (botIdPrefixes.some(p => msgId.startsWith(p))) return true;
-
-  // Verified business / bot badge on the account
+  // 2. Verified business / bot badge
   if (mek?.verifiedBizName) return true;
 
-  // All-uppercase hex exactly 32 chars — another Baileys pattern
+  // 3. Message ID length — real WA IDs are typically 16–32 chars,
+  //    many bot frameworks generate shorter or patterned IDs
+  if (msgId.length < 10 && msgId.length > 0) return true;
+
+  // 4. Message has no pushName (bots often send without a display name)
+  //    combined with a numeric-only JID pattern typical of bot numbers
+  const num = sender.split('@')[0].split(':')[0];
+  const hasPushName = !!(mek?.pushName);
+  if (!hasPushName && /^\d+$/.test(num) && num.length > 10) {
+    // Extra check: message is not from a human typing pattern
+    const msg = mek?.message;
+    const hasOnlyAutomatedTypes = msg && (
+      msg.protocolMessage ||
+      msg.senderKeyDistributionMessage ||
+      (msg.extendedTextMessage?.contextInfo?.isForwarded && !hasPushName)
+    );
+    if (hasOnlyAutomatedTypes) return true;
+  }
+
+  // 5. Bot-like message ID patterns (all uppercase hex, exactly 32 chars — common in bot frameworks)
   if (/^[0-9A-F]{32}$/.test(msgId)) return true;
 
   return false;
 }
 
-async function handleAntiBot(conn, mek, { from, sender, groupAdmins, botNumber, ownerNumbers } = {}) {
+async function handleAntiBot(conn, mek, { from, sender, groupAdmins } = {}) {
   try {
     if (!from?.endsWith('@g.us')) return;
-
-    // Skip the bot's own messages
     if (mek.key?.fromMe) return;
 
     const f = getFeature(from, FEATURE);
@@ -64,21 +60,17 @@ async function handleAntiBot(conn, mek, { from, sender, groupAdmins, botNumber, 
     // Skip reactions
     if (mek.message?.reactionMessage) return;
 
-    // Issue 1: Skip group admins (including bot-admin bots)
-    const participantDigits = participant.split('@')[0].split(':')[0].replace(/\D/g, '');
-    const adminDigits = (groupAdmins || []).map(j =>
-      j.split('@')[0].split(':')[0].replace(/\D/g, '')
-    );
-    if (adminDigits.includes(participantDigits)) return;
-
     // ── Handle edits (protocolMessage) ───────────────────────────────────
+    // When a bot sends "checking..." then edits to "51ms",
+    // the edit arrives as protocolMessage with proto.key = original message key
+    // Check original key id for 3EB0 prefix
     if (mek.message?.protocolMessage) {
       const proto   = mek.message.protocolMessage;
       const origKey = proto.key;
       if ((proto.type === 14 || proto.editedMessage) && origKey) {
-        const origId = (origKey.id || '').toUpperCase();
-        const botIdPrefixes = ['3EB0', 'BAE5', 'FALSE', 'TRUE', 'XYLO', 'CYPHER'];
-        if (botIdPrefixes.some(p => origId.startsWith(p))) {
+        const origId = origKey.id || '';
+        const botPrefixes = ['3EB0', 'FALSE', 'TRUE'];
+        if (botPrefixes.some(p => origId.toUpperCase().startsWith(p))) {
           await conn.sendMessage(from, { delete: mek.key }).catch(() => {});
           await conn.sendMessage(from, { delete: origKey }).catch(() => {});
         }
@@ -86,9 +78,13 @@ async function handleAntiBot(conn, mek, { from, sender, groupAdmins, botNumber, 
       return;
     }
 
-    // Issue 2: Pass botNumber and ownerNumbers to isBotMessage so it can exclude them
-    const _botNum = botNumber || conn?.user?.id?.split(':')[0] || '';
-    if (!isBotMessage(mek, _botNum, ownerNumbers || [])) return;
+    // ── Skip admins ───────────────────────────────────────────────────────
+    if (Array.isArray(groupAdmins) && groupAdmins.some(a =>
+      a.split('@')[0].split(':')[0] === participant.split('@')[0].split(':')[0]
+    )) return;
+
+    // ── Detect bot ────────────────────────────────────────────────────────
+    if (!isBotMessage(mek)) return;
 
     const mode      = f.mode;
     const settings  = getGroupSettings(from) || {};
@@ -128,7 +124,7 @@ async function handleAntiBot(conn, mek, { from, sender, groupAdmins, botNumber, 
       }
     }
   } catch (e) {
-    console.error('[NEXUS-MD] antibot error:', e.message);
+    console.error('[antibot]', e.message);
   }
 }
 
@@ -171,4 +167,3 @@ cast({
 });
 
 module.exports = { handleAntiBot };
-

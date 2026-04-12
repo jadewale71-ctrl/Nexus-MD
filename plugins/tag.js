@@ -13,10 +13,10 @@ cast({
   desc:     'Tag everyone silently. Works on text, media and group links.',
   category: 'group',
   filename: __filename,
-}, async (conn, mek, m, { from, q, isGroup, groupMetadata, isAdmins, isOwner, reply }) => {
+}, async (conn, mek, m, { from, q, isGroup, groupMetadata, isAdmins, isOwner, isSudo, reply }) => {
   try {
     if (!isGroup)              return reply('🚫 Groups only.');
-    if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
+    if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
 
     const mentions    = (groupMetadata?.participants || []).map(p => p.id);
     // sms() serializer: m.quoted.msg = the content object (m.quoted[m.quoted.type])
@@ -83,9 +83,9 @@ cast({
   desc:     'Tag everyone silently — standalone, no reply to command',
   category: 'group',
   filename: __filename,
-}, async (conn, mek, m, { from, q, isGroup, groupMetadata, isAdmins, isOwner }) => {
+}, async (conn, mek, m, { from, q, isGroup, groupMetadata, isAdmins, isOwner, isSudo }) => {
   try {
-    if (!isGroup || (!isAdmins && !isOwner)) return;
+    if (!isGroup || (!isAdmins && !isOwner && !isSudo)) return;
     const mentions    = (groupMetadata?.participants || []).map(p => p.id);
     const _qmsg2 = m.quoted?.msg;
     const _qText2 = typeof _qmsg2 === 'string'

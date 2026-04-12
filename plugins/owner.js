@@ -44,8 +44,8 @@ cast({
   // Turn off
   if (arg === 'off' || arg === 'deact' || arg === 'disable') {
     if (cur === 'false') return reply('*AntiCall is already disabled!*');
-    getMode(key) = 'false';
-    saveSettings(settings);
+    setMode(key, 'false'); 
+    saveSettings();        
     return reply('*✅ AntiCall disabled successfully!*');
   }
 
@@ -57,17 +57,19 @@ cast({
 
   // Set to all
   if (arg === 'all') {
-    getMode(key) === 'all';
-    saveSettings(settings);
+    setMode(key, 'all');   
+    saveSettings();        
     return reply('*✅ AntiCall set to block ALL calls!*');
   }
 
   // Set country codes
   const codes = arg.split(',').map(c => parseInt(c.trim())).filter(n => !isNaN(n));
   if (!codes.length) return reply('*❌ Invalid country codes.*\nExample: :anticall 212,91,231');
-  getMode(key) === codes.join(',');
-  saveSettings(settings);
-  reply(`*✅ AntiCall set — blocking calls from country codes: ${getMode(key)}*`);
+  
+  const newMode = codes.join(',');
+  setMode(key, newMode);   
+  saveSettings();          
+  reply(`*✅ AntiCall set — blocking calls from country codes: ${newMode}*`);
 });
 
 // ── registerAntiCall — hook call events ───────────────────────────────────────
@@ -358,19 +360,13 @@ cast({
 
 // ── STATUS SAVER — save ───────────────────────────────
 cast({
-
   pattern: "save",
-
   desc: "Save replied status to your DM",
-
   category: 'owner',
-
   filename: __filename
-
 }, saveStatusHandler);
 
 // emoji triggers
-
 cast({ pattern: "🙏", dontAddCommandList: true, filename: __filename }, saveStatusHandler);
 cast({ pattern: "📥", dontAddCommandList: true, filename: __filename }, saveStatusHandler);
 cast({ pattern: "💾", dontAddCommandList: true, filename: __filename }, saveStatusHandler);
@@ -379,41 +375,28 @@ cast({ pattern: "🔖", dontAddCommandList: true, filename: __filename }, saveSt
 cast({ pattern: "⬇️", dontAddCommandList: true, filename: __filename }, saveStatusHandler);
 
 async function saveStatusHandler(conn, mek, m, { sender }) {
-
   try {
-
     if (!m.quoted) return;
 
     // check if quoted message is from status
-
     const context = m.message?.extendedTextMessage?.contextInfo;
-
     if (!context?.remoteJid?.includes("status@broadcast")) {
-
       return; // not a status reply
-
     }
 
     const quotedMsg = context.quotedMessage;
-
     if (!quotedMsg) return;
 
     const mediaMessage =
-
       quotedMsg.imageMessage ||
-
       quotedMsg.videoMessage ||
-
       quotedMsg.audioMessage;
 
     if (!mediaMessage) return;
 
     // download media
-
     const buffer = await m.quoted.download();
-
     const caption = mediaMessage.caption || "";
-
     const targetJid = sender;
 
     if (mediaMessage.mimetype?.startsWith("image")) {
@@ -433,19 +416,14 @@ async function saveStatusHandler(conn, mek, m, { sender }) {
         ptt: mediaMessage.ptt || false
       }, { quoted: mek });
     }
-
   } catch (err) {
-
     console.error("Save Status Error:", err);
-
   }
-
 }
 
 // ── VIEW ONCE — vv ────────────────────────────────────
 
 // /vv + emoji triggers (sends VV media to command user's DM silently)
-
 cast({
   pattern: "vv",
   desc: "Get view once (send to DM).",
@@ -453,24 +431,9 @@ cast({
   filename: __filename
 }, vvHandler);
 
-cast({
-  pattern: "❤️",
-  dontAddCommandList: true,
-  filename: __filename
-}, vvHandler);
-
-cast({
-
-  pattern: "🌝",
-  dontAddCommandList: true,
-  filename: __filename
-}, vvHandler);
-
-cast({
-  pattern: "😂",
-  dontAddCommandList: true,
-  filename: __filename
-}, vvHandler);
+cast({ pattern: "❤️", dontAddCommandList: true, filename: __filename }, vvHandler);
+cast({ pattern: "🌝", dontAddCommandList: true, filename: __filename }, vvHandler);
+cast({ pattern: "😂", dontAddCommandList: true, filename: __filename }, vvHandler);
 cast({ pattern: "😡", dontAddCommandList: true, filename: __filename }, vvHandler);
 cast({ pattern: "😭", dontAddCommandList: true, filename: __filename }, vvHandler);
 cast({ pattern: "😳", dontAddCommandList: true, filename: __filename }, vvHandler);
@@ -480,13 +443,9 @@ cast({ pattern: "😔", dontAddCommandList: true, filename: __filename }, vvHand
 cast({ pattern: "🥺", dontAddCommandList: true, filename: __filename }, vvHandler);
 cast({ pattern: "🫴", dontAddCommandList: true, filename: __filename }, vvHandler);
 cast({ pattern: "😐", dontAddCommandList: true, filename: __filename }, vvHandler);
-cast({ pattern: "😂", dontAddCommandList: true, filename: __filename }, vvHandler);
-cast({ pattern: "❤️", dontAddCommandList: true, filename: __filename }, vvHandler);
-cast({ pattern: "🌝", dontAddCommandList: true, filename: __filename }, vvHandler);
 
 async function vvHandler(conn, mek, m, { sender, senderNumber }) {
   try {
-
     if (!m.quoted) return;
 
     const qmessage =
@@ -593,6 +552,81 @@ cast({
   const list = listSudo();
   if (!list.length) return reply('No sudo users set.');
   return reply(`*Sudo Users (${list.length}):*\n${list.map(n=>`• ${n}`).join('\n')}`);
+});
+
+// ── LIST DMS — listdms ────────────────────────────────────────────────
+
+cast({
+  pattern: 'listdms',
+  alias: ['dmstats', 'chatlist', 'privates'],
+  desc: 'List all private chats with last active time and cached message count',
+  category: 'owner',
+  filename: __filename,
+}, async (conn, mek, m, { isOwner, reply, smartReply }) => {
+  if (!isOwner) return reply('🚫 Owner only.');
+
+  try {
+    // This bot uses store.messages — get DM JIDs from there
+    let store;
+    try { store = require('../index').store; } catch {}
+
+    const messages = store?.messages;
+    if (!messages || !Object.keys(messages).length) {
+      return reply('⚠️ *No messages cached yet.* Send or receive a DM first, then try again.');
+    }
+
+    // Filter to DM JIDs only (not groups or broadcast)
+    const dmJids = Object.keys(messages).filter(jid =>
+      jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@broadcast')
+    );
+
+    if (!dmJids.length) return reply('📭 No private chats found yet. Send or receive a DM first.');
+
+    // store.messages = { jid: { messageId: messageObj } } — plain object, NOT array
+    const dmList = dmJids.map(jid => {
+      const chatMsgs = messages[jid] || {};
+
+      // Values are message objects keyed by message ID
+      const msgValues = Object.values(chatMsgs);
+      const count = msgValues.length;
+
+      // Find most recent timestamp
+      let lastTs = 0;
+      for (const msg of msgValues) {
+        const ts = msg?.messageTimestamp;
+        const t  = typeof ts === 'object' && ts?.toNumber ? ts.toNumber() : Number(ts || 0);
+        if (t > lastTs) lastTs = t;
+      }
+
+      return { jid, count, lastTs };
+    });
+
+    // Sort by most recent activity
+    dmList.sort((a, b) => b.lastTs - a.lastTs);
+
+    let text = `👤 *PRIVATE CHATS (DMs)*\n`;
+    text += `_${dmList.length} chat(s) seen since last bot start_\n\n`;
+    const mentions = [];
+
+    for (let i = 0; i < dmList.length; i++) {
+      const { jid, count, lastTs } = dmList[i];
+      const num      = jid.split('@')[0];
+      const lastTime = lastTs
+        ? new Date(lastTs * 1000).toLocaleString()
+        : 'Unknown';
+
+      text += `*${i + 1}.* @${num}\n`;
+      text += `   🕒 *Last:* ${lastTime}\n`;
+      text += `   💬 *Msgs cached:* ${count}\n\n`;
+      mentions.push(jid);
+    }
+
+    await conn.sendMessage(mek.key.remoteJid, { text: text.trim(), mentions }, { quoted: mek });
+
+  } catch (err) {
+    console.error('listdms error:', err);
+    reply(`❌ Error: ${err.message}`);
+  }
 });
 
 // ── HEROKU VARS ───────────────────────────────────────

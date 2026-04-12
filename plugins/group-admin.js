@@ -17,7 +17,7 @@ cast({
   desc: 'List all group JIDs and names (owner only)',
   category: 'group',
   filename: __filename
-}, async (conn, mek, m, { from, q, isOwner, reply }) => {
+}, async (conn, mek, m, { from, q, isOwner, isSudo, reply }) => {
   try {
     if (!isOwner) return reply('*Owner only!*');
     const groups  = await conn.groupFetchAllParticipating();
@@ -30,7 +30,7 @@ cast({
       if (!onlyNames) txt += `*JID:* ${id}`;
       txt += '\n';
     }
-    await conn.sendMessage(from, { text: txt }, { quoted: mek });
+    await conn.sendMessage(from, { text: txt }, { quoted: makeSmartQuote() });
   } catch (e) { reply(`❌ Error: ${e.message}`); }
 });
 
@@ -41,11 +41,10 @@ cast({
   desc: 'Reject all pending join requests',
   category: 'group',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isBotAdmins, isOwner, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
   try {
     if (!isGroup) return reply('*Groups only!*');
-    if (!isAdmins && !isOwner) return reply('*Admins only!*');
-    if (!isBotAdmins) return reply('*I need admin rights first!*');
+    if (!isAdmins && !isOwner && !isSudo) return reply('*Admins only!*');
     const list = await conn.groupRequestParticipantsList(from);
     if (!list?.length) return reply('*No pending join requests!*');
     const jids = [];
@@ -54,7 +53,7 @@ cast({
     }
     let txt = `✅ *Rejected ${jids.length} join request(s):*\n`;
     jids.forEach(jid => { txt += `• @${jid.split('@')[0]}\n`; });
-    await conn.sendMessage(from, { text: txt, mentions: jids }, { quoted: mek });
+    await conn.sendMessage(from, { text: txt, mentions: jids }, { quoted: makeSmartQuote() });
   } catch (e) { reply(`❌ Error: ${e.message}`); }
 });
 
@@ -65,11 +64,10 @@ cast({
   desc: 'Accept all pending join requests',
   category: 'group',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isBotAdmins, isOwner, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
   try {
     if (!isGroup) return reply('*Groups only!*');
-    if (!isAdmins && !isOwner) return reply('*Admins only!*');
-    if (!isBotAdmins) return reply('*I need admin rights first!*');
+    if (!isAdmins && !isOwner && !isSudo) return reply('*Admins only!*');
     const list = await conn.groupRequestParticipantsList(from);
     if (!list?.length) return reply('*No pending join requests!*');
     const jids = [];
@@ -78,7 +76,7 @@ cast({
     }
     let txt = `✅ *Accepted ${jids.length} join request(s):*\n`;
     jids.forEach(jid => { txt += `• @${jid.split('@')[0]}\n`; });
-    await conn.sendMessage(from, { text: txt, mentions: jids }, { quoted: mek });
+    await conn.sendMessage(from, { text: txt, mentions: jids }, { quoted: makeSmartQuote() });
   } catch (e) { reply(`❌ Error: ${e.message}`); }
 });
 
@@ -89,17 +87,16 @@ cast({
   desc: 'List all pending join requests',
   category: 'group',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isBotAdmins, isOwner, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
   try {
     if (!isGroup) return reply('*Groups only!*');
-    if (!isAdmins && !isOwner) return reply('*Admins only!*');
-    if (!isBotAdmins) return reply('*I need admin rights first!*');
+    if (!isAdmins && !isOwner && !isSudo) return reply('*Admins only!*');
     const list = await conn.groupRequestParticipantsList(from);
     if (!list?.length) return reply('*No pending join requests!*');
     const jids = list.map(r => r.jid);
     let txt = `📋 *Pending Join Requests (${jids.length}):*\n\n`;
     jids.forEach((jid, i) => { txt += `${i + 1}. @${jid.split('@')[0]}\n`; });
-    await conn.sendMessage(from, { text: txt, mentions: jids }, { quoted: mek });
+    await conn.sendMessage(from, { text: txt, mentions: jids }, { quoted: makeSmartQuote() });
   } catch (e) { reply(`❌ Error: ${e.message}`); }
 });
 
@@ -118,7 +115,7 @@ cast({
     await conn.sendMessage(from, {
       text: `🎯 The most *${q}* person around us is @${picked.split('@')[0]}!`,
       mentions: [picked]
-    }, { quoted: mek });
+    }, { quoted: makeSmartQuote() });
   } catch (e) { reply(`❌ Error: ${e.message}`); }
 });
 
@@ -128,7 +125,7 @@ cast({
   desc: 'Find common members between two groups (owner only)',
   category: 'group',
   filename: __filename
-}, async (conn, mek, m, { from, q, isOwner, reply }) => {
+}, async (conn, mek, m, { from, q, isOwner, isSudo, reply }) => {
   try {
     if (!isOwner) return reply('*Owner only!*');
     const jids = (q || '').match(/\d+@g\.us/g);
@@ -139,7 +136,7 @@ cast({
     const ids = common.map(p => p.id);
     let txt = `🔗 *Common Members (${ids.length})*\n*${g1.subject}* ↔ *${g2.subject}*\n\n`;
     ids.forEach((id, i) => { txt += `${i + 1}. @${id.split('@')[0]}\n`; });
-    await conn.sendMessage(from, { text: txt, mentions: ids }, { quoted: mek });
+    await conn.sendMessage(from, { text: txt, mentions: ids }, { quoted: makeSmartQuote() });
   } catch (e) { reply(`❌ Error: ${e.message}`); }
 });
 
@@ -149,7 +146,7 @@ cast({
   desc: 'Members in group 1 but not in group 2 (owner only)',
   category: 'group',
   filename: __filename
-}, async (conn, mek, m, { from, q, isOwner, reply }) => {
+}, async (conn, mek, m, { from, q, isOwner, isSudo, reply }) => {
   try {
     if (!isOwner) return reply('*Owner only!*');
     const jids = (q || '').match(/\d+@g\.us/g);
@@ -160,7 +157,7 @@ cast({
     const ids = diff.map(p => p.id);
     let txt = `📊 *Members only in "${g1.subject}" (${ids.length}):*\n\n`;
     ids.forEach((id, i) => { txt += `${i + 1}. @${id.split('@')[0]}\n`; });
-    await conn.sendMessage(from, { text: txt, mentions: ids }, { quoted: mek });
+    await conn.sendMessage(from, { text: txt, mentions: ids }, { quoted: makeSmartQuote() });
   } catch (e) { reply(`❌ Error: ${e.message}`); }
 });
 
@@ -186,7 +183,7 @@ cast({
   await conn.sendMessage(from, {
     text: `👑 *Group Admins (${admins.length})*\n\n${lines.join('\n')}`,
     mentions: admins.map(a => a.id)
-  }, { quoted: mek });
+  }, { quoted: makeSmartQuote() });
 });
 
 // ── members ───────────────────────────────────────────────────────────
@@ -205,7 +202,7 @@ cast({
     return `${i + 1}. ${badge} +${p.id.split('@')[0]}`;
   });
   const text = `👥 *${groupName} (${participants.length} members)*\n\n${lines.join('\n')}`;
-  await conn.sendMessage(from, { text: text.substring(0, 4000) }, { quoted: mek });
+  await conn.sendMessage(from, { text: text.substring(0, 4000) }, { quoted: makeSmartQuote() });
 });
 
 // ── invitelink ────────────────────────────────────────────────────────
@@ -216,14 +213,14 @@ cast({
   category: 'group',
   react:    '🔗',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, reply }) => {
   if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+  if (!isAdmins && !isOwner && !isSudo) return reply('❌ Admins only.');
   try {
     const code = await conn.groupInviteCode(from);
     await conn.sendMessage(from, {
       text: `🔗 *Group Invite Link*\n\nhttps://chat.whatsapp.com/${code}`
-    }, { quoted: mek });
+    }, { quoted: makeSmartQuote() });
   } catch { reply('❌ Failed to get link. Make sure I am an admin.'); }
 });
 
@@ -235,16 +232,16 @@ cast({
   category: 'group',
   react:    '🔗',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isBotAdmins, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, isBotAdmins, reply }) => {
   if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+  if (!isAdmins && !isOwner && !isSudo) return reply('❌ Admins only.');
   if (!isBotAdmins) return reply('❌ I need to be an admin.');
   try {
     await conn.groupRevokeInvite(from);
     const newCode = await conn.groupInviteCode(from);
     await conn.sendMessage(from, {
       text: `✅ *Invite link revoked!*\n\nNew link:\nhttps://chat.whatsapp.com/${newCode}`
-    }, { quoted: mek });
+    }, { quoted: makeSmartQuote() });
   } catch { reply('❌ Failed to revoke link.'); }
 });
 
@@ -257,9 +254,9 @@ cast({
   category: 'group',
   react:    '⏱️',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isBotAdmins, args, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, isBotAdmins, args, reply }) => {
   if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
+  if (!isAdmins && !isOwner && !isSudo) return reply('❌ Admins only.');
   if (!isBotAdmins) return reply('❌ I need to be an admin.');
   const opts = { off: 0, '24h': 86400, '7d': 604800, '90d': 7776000 };
   const key  = (args[0] || '').toLowerCase();
@@ -278,16 +275,15 @@ cast({
   category: 'group',
   react:    '🦾',
   filename: __filename
-}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isBotAdmins, participants, reply }) => {
+}, async (conn, mek, m, { from, isGroup, isAdmins, isOwner, isSudo, participants, reply }) => {
   if (!isGroup) return reply('🚫 Groups only.');
-  if (!isAdmins && !isOwner) return reply('❌ Admins only.');
-  if (!isBotAdmins) return reply('❌ I need to be an admin.');
+  if (!isAdmins && !isOwner && !isSudo) return reply('❌ Admins only.');
   const botId     = conn.user.id.split(':')[0] + '@s.whatsapp.net';
   const nonAdmins = (participants || []).filter(p => !p.admin && p.id !== botId);
   if (!nonAdmins.length) return reply('✅ No non-admin members to remove.');
   await conn.sendMessage(from, {
     text: `⏳ Kicking ${nonAdmins.length} members...`
-  }, { quoted: mek });
+  }, { quoted: makeSmartQuote() });
   let kicked = 0;
   for (const p of nonAdmins) {
     try { await conn.groupParticipantsUpdate(from, [p.id], 'remove'); kicked++; } catch {}
@@ -303,8 +299,8 @@ cast({
   desc:     'Delete a replied message',
   category: 'group',
   filename: __filename,
-}, async (conn, mek, m, { from, isAdmins, isOwner, reply }) => {
-  if (!isAdmins && !isOwner) return reply('⚠️ Admins only.');
+}, async (conn, mek, m, { from, isAdmins, isOwner, isSudo, reply }) => {
+  if (!isAdmins && !isOwner && !isSudo) return reply('⚠️ Admins only.');
   if (!m.quoted) return reply('❗ Reply to a message to delete it.');
   try {
     await conn.sendMessage(from, { delete: m.quoted.fakeObj?.key || {
