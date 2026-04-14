@@ -554,77 +554,99 @@ cast({
   return reply(`*Sudo Users (${list.length}):*\n${list.map(n=>`• ${n}`).join('\n')}`);
 });
 
-// ── LIST DMS — listdms ────────────────────────────────────────────────
+// ── LISTPC / LISTDMS ────────────────────────────────────────────────────────
 
 cast({
-  pattern: 'listdms',
-  alias: ['dmstats', 'chatlist', 'privates'],
-  desc: 'List all private chats with last active time and cached message count',
+  pattern:  'listpc',
+  alias:    ['listdms', 'dmstats', 'chatlist', 'privates'],
+  desc:     'List all personal/private chats with unread count and last active time',
   category: 'owner',
   filename: __filename,
-}, async (conn, mek, m, { isOwner, reply, smartReply }) => {
+}, async (conn, mek, m, { from, isOwner, reply }) => {
   if (!isOwner) return reply('🚫 Owner only.');
-
   try {
-    // This bot uses store.messages — get DM JIDs from there
     let store;
     try { store = require('../index').store; } catch {}
 
-    const messages = store?.messages;
-    if (!messages || !Object.keys(messages).length) {
-      return reply('⚠️ *No messages cached yet.* Send or receive a DM first, then try again.');
+    // ── Try store.chats first (new store.js) ──────────────────────────────
+    const chatsList = store?.chats?.all?.();
+
+    if (chatsList && chatsList.length) {
+      // Use proper store.chats — has unreadCount and conversationTimestamp
+      const dms = chatsList
+        .filter(c => c.id && c.id.endsWith('@s.whatsapp.net'))
+        .sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0));
+
+      if (!dms.length) return reply('📭 No personal chats found yet.');
+
+      const config   = require('../config');
+      const timezone = config.TIMEZONE || 'UTC';
+      const botName  = config.BOT_NAME || 'NEXUS-MD';
+
+      let text = `👤 *${botName}'s PM User List*
+`;
+      text += `Total *${dms.length}* users in personal chat.
+
+`;
+      const mentions = [];
+
+      for (const chat of dms) {
+        const num      = chat.id.split('@')[0];
+        const lastChat = chat.conversationTimestamp
+          ? new Date(chat.conversationTimestamp * 1000).toLocaleString('en-GB', { timeZone: timezone })
+          : 'Unknown';
+
+        text += `User: @${num}`;
+        if (chat.name) text += ` (${chat.name})`;
+        text += `
+Unread: ${chat.unreadCount || 0}
+Last chat: ${lastChat}
+
+`;
+        mentions.push(chat.id);
+      }
+
+      return conn.sendMessage(from, { text: text.trim(), mentions }, { quoted: mek });
     }
 
-    // Filter to DM JIDs only (not groups or broadcast)
-    const dmJids = Object.keys(messages).filter(jid =>
-      jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@broadcast')
-    );
+    // ── Fallback: use store.messages (old store.js) ───────────────────────
+    const messages = store?.messages;
+    if (!messages || !Object.keys(messages).length)
+      return reply('⚠️ No messages cached yet. Send or receive a DM first.');
 
-    if (!dmJids.length) return reply('📭 No private chats found yet. Send or receive a DM first.');
+    const dmJids = Object.keys(messages).filter(jid => jid.endsWith('@s.whatsapp.net'));
+    if (!dmJids.length) return reply('📭 No personal chats found yet.');
 
-    // store.messages = { jid: { messageId: messageObj } } — plain object, NOT array
     const dmList = dmJids.map(jid => {
-      const chatMsgs = messages[jid] || {};
-
-      // Values are message objects keyed by message ID
-      const msgValues = Object.values(chatMsgs);
-      const count = msgValues.length;
-
-      // Find most recent timestamp
+      const msgValues = Object.values(messages[jid] || {});
       let lastTs = 0;
       for (const msg of msgValues) {
         const ts = msg?.messageTimestamp;
         const t  = typeof ts === 'object' && ts?.toNumber ? ts.toNumber() : Number(ts || 0);
         if (t > lastTs) lastTs = t;
       }
+      return { jid, count: msgValues.length, lastTs };
+    }).sort((a, b) => b.lastTs - a.lastTs);
 
-      return { jid, count, lastTs };
-    });
+    let text = `👤 *PM User List*
+Total *${dmList.length}* personal chats.
 
-    // Sort by most recent activity
-    dmList.sort((a, b) => b.lastTs - a.lastTs);
-
-    let text = `👤 *PRIVATE CHATS (DMs)*\n`;
-    text += `_${dmList.length} chat(s) seen since last bot start_\n\n`;
+`;
     const mentions = [];
-
-    for (let i = 0; i < dmList.length; i++) {
-      const { jid, count, lastTs } = dmList[i];
+    for (const { jid, count, lastTs } of dmList) {
       const num      = jid.split('@')[0];
-      const lastTime = lastTs
-        ? new Date(lastTs * 1000).toLocaleString()
-        : 'Unknown';
+      const lastChat = lastTs ? new Date(lastTs * 1000).toLocaleString() : 'Unknown';
+      text += `User: @${num}
+Messages: ${count}
+Last chat: ${lastChat}
 
-      text += `*${i + 1}.* @${num}\n`;
-      text += `   🕒 *Last:* ${lastTime}\n`;
-      text += `   💬 *Msgs cached:* ${count}\n\n`;
+`;
       mentions.push(jid);
     }
-
-    await conn.sendMessage(mek.key.remoteJid, { text: text.trim(), mentions }, { quoted: mek });
+    conn.sendMessage(from, { text: text.trim(), mentions }, { quoted: mek });
 
   } catch (err) {
-    console.error('listdms error:', err);
+    console.error('[listpc] error:', err);
     reply(`❌ Error: ${err.message}`);
   }
 });

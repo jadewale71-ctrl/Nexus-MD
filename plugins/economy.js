@@ -1,13 +1,13 @@
 // plugins/economy.js
-// Enhanced Economy & Underworld Plugin for NEXUS-MD — Weirdos World
+// Enhanced Economy & Underworld Plugin for Platinum-V2 — Weirdos World
 // FULLY INTEGRATED WITH RPG ECOSYSTEM (`rpgplayers` collection)
 // v4.0 — Location-locked Rob, Gear-based Stats, Gang Rob, Economy Drains Toggle
 
-const { cmd } = require("../command");
+const { cast, makeSmartQuote } = require('../cast');
 const { MongoClient } = require("mongodb");
 const { lidToPhone } = require("../lib/lid");
 
-const uri = process.env.MONGO_URI || "mongodb+srv://botUser:susanoo900@cluster0.6m9ra.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
+const uri = process.env.MONGO_URI || "mongodb+srv://anthonycampbell736_db_user:R9eP6aJQssTrz6DW@nexus-md.zoatrff.mongodb.net/?appName=Nexus-MD";
 const client = new MongoClient(uri, {});
 
 let _db;
@@ -123,10 +123,10 @@ async function getAccount(id) {
 
   // Medical bill on auto-discharge
   if (acc.jailedUntil && acc.jailedUntil > 0 && acc.jailedUntil <= Date.now()) {
-      acc.jailedUntil = 0;
+      acc.jailedUntil = 0; acc.inJail = false;
       if (acc.health <= 0) acc.health = 20;
-      const bill = Math.min(acc.money || 0, iC(500) * (acc.level || 1));
-      if (bill > 0) { acc.money = Math.max(0, acc.money - bill); logFinancial(acc, `Hospital discharge fee`, -bill); }
+      const bill = iC(500) * (acc.level || 1);
+      if (bill > 0) { acc.money = Math.max(MIN_WALLET, (acc.money || 0) - bill); logFinancial(acc, `Hospital discharge fee`, -bill); }
   }
 
   // Passive crimeLevel decay: -5 per hour
@@ -140,31 +140,46 @@ async function getAccount(id) {
   // Hourly economy drains
   await applyHourlyDrains(acc);
 
-  // Loan shark compound interest — ticks every 5 min regardless of what command runs
+  // Loan shark — HOURLY compounding (not per-5-min — that was way too aggressive)
   if (acc.activeLoan && acc.activeLoan.owed > 0) {
-      const COMPOUND_INTERVAL = 5 * 60 * 1000;
-      const RATE_PER_5MIN     = 0.02; // 2% per 5 min
-      const intervals = Math.floor((Date.now() - (acc.activeLoan.lastCompound || acc.activeLoan.takenAt || 0)) / COMPOUND_INTERVAL);
-      if (intervals > 0) {
-          let owed = acc.activeLoan.owed;
-          for (let i = 0; i < intervals; i++) owed = Math.ceil(owed * (1 + RATE_PER_5MIN));
-          acc.activeLoan.owed         = owed;
-          acc.activeLoan.lastCompound = (acc.activeLoan.lastCompound || acc.activeLoan.takenAt) + intervals * COMPOUND_INTERVAL;
-      }
-      // Auto-deduct after 2 hours unpaid — shark takes 25% of wallet+bank each time
-      const AGE_MS = Date.now() - (acc.activeLoan.takenAt || 0);
-      if (AGE_MS >= 2 * 60 * 60 * 1000 && (acc.money > 0 || acc.bank > 0)) {
-          const targetPay = Math.ceil(acc.activeLoan.owed * 0.25);
-          const fromWallet = Math.min(acc.money || 0, targetPay);
-          acc.money -= fromWallet;
-          const fromBank = Math.min(acc.bank || 0, targetPay - fromWallet);
-          acc.bank = Math.max(0, (acc.bank || 0) - fromBank);
-          const forcePay = fromWallet + fromBank;
-          if (forcePay > 0) {
-              acc.activeLoan.owed -= forcePay;
-              logFinancial(acc, `🦈 Shark collected — wallet + bank`, -forcePay);
+      const HOURLY_INTERVAL = 60 * 60 * 1000; // 1 hour
+      const GRACE_PERIOD    = 2 * 60 * 60 * 1000; // 2hr grace — no interest
+      const loanAge = Date.now() - (acc.activeLoan.takenAt || 0);
+
+      if (loanAge > GRACE_PERIOD) {
+          // Credit score determines interest rate:
+          // 750+  → 0.5%/hr  | 680+ → 0.8%/hr | 580+ → 1%/hr | 480+ → 1.2%/hr | <480 → 1.5%/hr
+          const _s = acc.activeLoan.creditScore || 580;
+          const RATE_PER_HOUR = _s >= 750 ? 0.005 : _s >= 680 ? 0.008 : _s >= 580 ? 0.010 : _s >= 480 ? 0.012 : 0.015;
+
+          const lastComp  = acc.activeLoan.lastCompound || (acc.activeLoan.takenAt + GRACE_PERIOD);
+          const intervals = Math.floor((Date.now() - lastComp) / HOURLY_INTERVAL);
+          if (intervals > 0) {
+              let owed = acc.activeLoan.owed;
+              for (let i = 0; i < intervals; i++) owed = Math.ceil(owed * (1 + RATE_PER_HOUR));
+              acc.activeLoan.owed         = owed;
+              acc.activeLoan.lastCompound = lastComp + intervals * HOURLY_INTERVAL;
           }
-          if (acc.activeLoan.owed <= 0) acc.activeLoan = null;
+
+          // Auto-deduct after 6 hours overdue — shark takes 20% of wallet+bank
+          // (was 2hr, now 6hr — players need time to respond)
+          if (loanAge >= 6 * 60 * 60 * 1000 && (acc.money > 0 || acc.bank > 0)) {
+              const lastAutoDeduct = acc.activeLoan.lastAutoDeduct || 0;
+              if (Date.now() - lastAutoDeduct >= 6 * 60 * 60 * 1000) { // once per 6hr max
+                  const targetPay  = Math.ceil(acc.activeLoan.owed * 0.20);
+                  const fromWallet = Math.min(Math.max(0, acc.money || 0), targetPay);
+                  acc.money        = Math.max(MIN_WALLET, (acc.money || 0) - fromWallet);
+                  const fromBank   = Math.min(acc.bank || 0, targetPay - fromWallet);
+                  acc.bank         = Math.max(0, (acc.bank || 0) - fromBank);
+                  const forcePay   = fromWallet + fromBank;
+                  if (forcePay > 0) {
+                      acc.activeLoan.owed        -= forcePay;
+                      acc.activeLoan.lastAutoDeduct = Date.now();
+                      logFinancial(acc, `🦈 Shark auto-collected (6hr overdue)`, -forcePay);
+                  }
+                  if (acc.activeLoan.owed <= 0) acc.activeLoan = null;
+              }
+          }
       }
   }
 
@@ -219,7 +234,7 @@ function logFinancial(acc, description, amount) {
     const sign = amount >= 0 ? `+${fmtMoney(amount)}` : `-${fmtMoney(Math.abs(amount))}`;
     acc.financialHistory = acc.financialHistory || [];
     acc.financialHistory.push(`[${timeStr}] ${sign} — ${description}`);
-    if (acc.financialHistory.length > 20) acc.financialHistory.shift();
+    if (acc.financialHistory.length > 100) acc.financialHistory.shift();
 }
 
 function crimeLevelBar(lvl) {
@@ -241,7 +256,7 @@ async function addExp(acc, amount){
     acc.health = acc.maxHealth;
     acc.maxEnergy += 5;
     acc.energy = acc.maxEnergy;
-    acc.money += 250 * acc.level;
+    acc.money += 250 * acc.level; logFinancial(acc, `⭐ Level up bonus (Level ${acc.level})`, 250 * acc.level);
     leveled = true;
   }
   await saveAccount(acc);
@@ -250,16 +265,40 @@ async function addExp(acc, amount){
 
 function fmtMoney(x) { return `$${Number(x).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`; }
 
-const VAT_RATE = 0.12;
+const VAT_RATE_BASE = 0.12;
+const MIN_WALLET = -500000; // wallet floor for negative balance
+const MAX_WALLET = 999_000_000_000; // $999B hard cap
+const MAX_BANK   = 999_000_000_000;
+function capBalance(n){ return Math.min(n, MAX_WALLET); }
+
 function applyVAT(gross) {
-    const vat = Math.ceil(gross * VAT_RATE);
+    if (!global.weirdo_tax_enabled) return { net: gross, vat: 0 };
+    const presDiscount = (global.wwPresident && global.wwPresident.termEndsAt > Date.now()) ? 0.02 : 0;
+    const rate = Math.max(0, VAT_RATE_BASE - presDiscount);
+    const vat  = Math.ceil(gross * rate);
     return { net: gross - vat, vat };
 }
 
 // ─── GLOBAL FLAGS — safe defaults before DB config loads ────────────────────
 if (global.weirdo_drains_enabled === undefined) global.weirdo_drains_enabled = true;
 if (global.weirdo_tax_enabled    === undefined) global.weirdo_tax_enabled    = true;
+if (global.wealth_drain_enabled  === undefined) global.wealth_drain_enabled  = true;
 if (global.INFLATION_MULT        === undefined) global.INFLATION_MULT        = 1;
+
+// Load toggles from DB on startup (runs once, overwrites defaults above)
+(async () => {
+    try {
+        const db  = await connectDB();
+        const cfg = await db.collection('weirdo_config').findOne({ _id: 'game_config' });
+        if (cfg) {
+            if (cfg.drainsEnabled    !== undefined) global.weirdo_drains_enabled = cfg.drainsEnabled;
+            if (cfg.wealthDrainEnabled !== undefined) global.wealth_drain_enabled = cfg.wealthDrainEnabled;
+            if (cfg.taxEnabled       !== undefined) global.weirdo_tax_enabled    = cfg.taxEnabled;
+            if (cfg.inflationMult    !== undefined) global.INFLATION_MULT        = cfg.inflationMult;
+            console.log(`✅ economy.js config loaded — drains:${global.weirdo_drains_enabled} tax:${global.weirdo_tax_enabled} inflation:x${global.INFLATION_MULT}`);
+        }
+    } catch(e) { console.error('economy.js config load error:', e.message); }
+})();
 
 // Scale any cost by current inflation
 function iC(base) { return Math.ceil(base * global.INFLATION_MULT); }
@@ -279,9 +318,9 @@ function normLoc(loc) { if (!loc) return 'Weirdos World'; const k = loc.trim().t
 async function saveGameConfig() {
     try {
         const db = await connectDB();
-        await db.collection('rpggameconfigs').updateOne(
+        await db.collection('weirdo_config').updateOne(
             { _id: 'game_config' },
-            { $set: { inflationMult: global.INFLATION_MULT, drainsEnabled: global.weirdo_drains_enabled } },
+            { $set: { inflationMult: global.INFLATION_MULT, drainsEnabled: global.weirdo_drains_enabled, wealthDrainEnabled: global.wealth_drain_enabled, taxEnabled: global.weirdo_tax_enabled } },
             { upsert: true }
         );
     } catch (e) { console.error('economy saveGameConfig error:', e.message); }
@@ -333,32 +372,37 @@ async function applyHourlyDrains(acc) {
             propTax += Math.ceil((DEFAULT_PROP_PRICES[propId] || 0) * PROPERTY_TAX_RATE * (qty || 0) * propTicks);
         }
         if (propTax > 0) {
-            if (acc.money >= propTax) { acc.money -= propTax; }
-            else {
-                // evict from most expensive property
+            if (acc.money >= propTax) {
+                acc.money -= propTax;
+                logFinancial(acc, `🏠 Property tax (${propTicks}hr)`, -propTax);
+            } else {
                 const sorted = Object.entries(acc.properties).sort((a,b) => (DEFAULT_PROP_PRICES[b[0]]||0)-(DEFAULT_PROP_PRICES[a[0]]||0));
                 if (sorted.length > 0) {
                     const [evId] = sorted[0];
                     acc.properties[evId] = Math.max(0, (acc.properties[evId]||1) - 1);
                     if (acc.properties[evId] === 0) delete acc.properties[evId];
+                    logFinancial(acc, `⚠️ Evicted from ${evId} (unpaid tax)`, 0);
                 }
-                acc.money = Math.max(0, acc.money - propTax);
+                acc.money = Math.max(MIN_WALLET, acc.money - propTax);
+                logFinancial(acc, `🏠 Property tax (${propTicks}hr) — partial`, -propTax);
             }
         }
         acc.lastPropertyTax = currentTime;
     }
 
-    // Wealth tax
+    // Wealth tax — separate toggle (togglewealthdrain)
+    const wealthDrainOn = global.wealth_drain_enabled !== false;
     const wealthTicks = Math.floor((currentTime - (acc.lastWealthTax || currentTime)) / hourMs);
-    if (wealthTicks >= 1) {
+    if (wealthDrainOn && wealthTicks >= 1) {
         const total = (acc.money || 0) + (acc.bank || 0);
         const rate = getWealthTaxRate(total);
         if (rate > 0) {
-            const wt = Math.ceil(total * rate * wealthTicks);
             const walletShare = Math.ceil(acc.money * rate * wealthTicks);
             const bankShare   = Math.ceil((acc.bank||0) * rate * wealthTicks);
-            acc.money = Math.max(0, acc.money - walletShare);
+            const totalTax    = walletShare + bankShare;
+            acc.money = Math.max(MIN_WALLET, acc.money - walletShare);
             acc.bank  = Math.max(0, (acc.bank||0) - bankShare);
+            logFinancial(acc, `💸 Wealth tax ${(rate*100).toFixed(1)}%/hr (${wealthTicks}hr)`, -totalTax);
         }
         acc.lastWealthTax = currentTime;
     }
@@ -367,12 +411,19 @@ async function applyHourlyDrains(acc) {
     const gearTicks = Math.floor((currentTime - (acc.lastGearMaintenance || currentTime)) / hourMs);
     if (gearTicks >= 1) {
         const slots = ['equippedWeapon','equippedArmor','equippedHelmet','equippedGloves','equippedKneePads','equippedBoots'];
+        let totalGearCost = 0;
         for (const slot of slots) {
             if (!acc[slot]) continue;
             const cost = iC(GEAR_MAINTENANCE_BASE[getItemRarity(acc[slot])] || 200) * gearTicks;
-            if (acc.money >= cost) { acc.money -= cost; }
-            else { acc[slot] = null; } // unequip if can't pay
+            if (acc.money >= cost) {
+                acc.money -= cost;
+                totalGearCost += cost;
+            } else {
+                logFinancial(acc, `🔧 ${acc[slot]} broke down (no maintenance funds)`, 0);
+                acc[slot] = null;
+            }
         }
+        if (totalGearCost > 0) logFinancial(acc, `🔧 Gear maintenance (${gearTicks}hr)`, -totalGearCost);
         acc.lastGearMaintenance = currentTime;
     }
 
@@ -380,8 +431,13 @@ async function applyHourlyDrains(acc) {
     const factionTicks = Math.floor((currentTime - (acc.lastFactionDues || currentTime)) / hourMs);
     if (factionTicks >= 1 && acc.faction) {
         const dues = iC(FACTION_DUES_BASE) * factionTicks;
-        if (acc.money >= dues) { acc.money -= dues; }
-        else { acc.faction = null; } // kicked for non-payment
+        if (acc.money >= dues) {
+            acc.money -= dues;
+            logFinancial(acc, `🏢 Faction dues (${factionTicks}hr)`, -dues);
+        } else {
+            logFinancial(acc, `🏢 Kicked from faction (unpaid dues ${fmtMoney(dues)})`, 0);
+            acc.faction = null;
+        }
         acc.lastFactionDues = currentTime;
     }
 }
@@ -474,17 +530,18 @@ const BLACKMARKET = {
 };
 
 const JOBS = [
-  { name: "street cleaner",   min: 200,   max: 500,    expReq: 0 },
-  { name: "delivery driver",  min: 500,   max: 1000,   expReq: 10 },
-  { name: "mechanic",         min: 800,   max: 1600,   expReq: 25 },
-  { name: "security guard",   min: 1200,  max: 2400,   expReq: 40 },
-  { name: "teacher",          min: 2000,  max: 3600,   expReq: 80 },
-  { name: "nurse",            min: 2800,  max: 4800,   expReq: 120 },
-  { name: "police officer",   min: 3600,  max: 6400,   expReq: 180 },
-  { name: "lawyer",           min: 6000,  max: 10000,  expReq: 300 },
-  { name: "software engineer",min: 10000, max: 18000,  expReq: 500 },
-  { name: "surgeon",          min: 16000, max: 28000,  expReq: 800 },
-  { name: "astronaut",        min: 32000, max: 60000,  expReq: 1500 }
+  // name, min, max, expReq, levelReq, statReq {stat, min}, note
+  { name: "street cleaner",   min: 80,     max: 200,    expReq: 0,    levelReq: 1,  statReq: null,                         note: "No requirements" },
+  { name: "delivery driver",  min: 150,    max: 400,    expReq: 10,   levelReq: 2,  statReq: { stat: 'speed', min: 5 },    note: "Req: 5 Speed" },
+  { name: "mechanic",         min: 300,    max: 700,    expReq: 25,   levelReq: 4,  statReq: { stat: 'dexterity', min: 8 },note: "Req: 8 Dexterity" },
+  { name: "security guard",   min: 500,    max: 1200,   expReq: 40,   levelReq: 5,  statReq: { stat: 'strength', min: 10 },note: "Req: 10 Strength" },
+  { name: "teacher",          min: 800,    max: 1800,   expReq: 80,   levelReq: 8,  statReq: { stat: 'intelligence', min: 10 }, note: "Req: 10 Intelligence" },
+  { name: "nurse",            min: 1400,   max: 2800,   expReq: 120,  levelReq: 10, statReq: { stat: 'intelligence', min: 15 }, note: "Req: Level 10 + 15 Intelligence" },
+  { name: "police officer",   min: 2000,   max: 4500,   expReq: 180,  levelReq: 12, statReq: { stat: 'strength', min: 20 },note: "Req: Level 12 + 20 Strength" },
+  { name: "lawyer",           min: 3500,   max: 7000,   expReq: 300,  levelReq: 15, statReq: { stat: 'intelligence', min: 30 }, degreeReq: 'law', note: "Req: Level 15 + Law degree + 30 Intel" },
+  { name: "software engineer",min: 5000,   max: 10000,  expReq: 500,  levelReq: 20, statReq: { stat: 'intelligence', min: 50 }, degreeReq: 'computerscience', note: "Req: Level 20 + CS degree + 50 Intel" },
+  { name: "surgeon",          min: 8000,   max: 16000,  expReq: 800,  levelReq: 25, statReq: { stat: 'intelligence', min: 80 }, degreeReq: 'nursing', note: "Req: Level 25 + Nursing degree + 80 Intel" },
+  { name: "astronaut",        min: 13000,  max: 25000,  expReq: 1500, levelReq: 35, statReq: { stat: 'endurance', min: 100 }, note: "Req: Level 35 + 100 Endurance" }
 ];
 
 /* ----------------- Commands ------------------ */
@@ -524,11 +581,67 @@ async function handleWalletCmd(conn, mek, m, { args, reply }) {
       return conn.sendMessage(m.chat, { text, mentions: [toJid(acc._id)] }, { quoted: mek });
   } catch(e) { console.error(e); }
 }
-cmd({ pattern: 'wallet',  desc: 'Check your wallet and bank balance', category: 'rpg', filename: __filename }, handleWalletCmd);
-cmd({ pattern: 'bankbal', desc: 'Check finances (alias: wallet)',     category: 'rpg', filename: __filename }, handleWalletCmd);
+cast({ pattern: 'wallet',  desc: 'Check your wallet and bank balance', category: 'rpg', filename: __filename }, handleWalletCmd);
+cast({ pattern: 'bankbal', desc: 'Check finances (alias: wallet)',     category: 'rpg', filename: __filename }, handleWalletCmd);
 
 // BANKING
-cmd({ pattern: "bank", desc: "Deposit or withdraw safe money", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// LOAN AUTO-DEDUCTION HELPER
+// Call this whenever a player receives money (wage, wire, gamble, etc.)
+// It checks if they have an active shark loan and auto-pays as much as possible.
+// Returns a message string to APPEND to the existing reply, or '' if no loan.
+// ─────────────────────────────────────────────────────────────────────────────
+function tryDeductLoan(acc, credited, sourceLabel) {
+    if (!acc.activeLoan || acc.activeLoan.owed <= 0) return '';
+    const owed      = acc.activeLoan.owed;
+    const deduct    = Math.min(credited, owed, acc.money); // only take what was just credited
+    if (deduct <= 0) return '';
+    acc.money -= deduct;
+    acc.activeLoan.owed -= deduct;
+    logFinancial(acc, `🦈 Shark auto-deducted from ${sourceLabel}`, -deduct);
+    if (acc.activeLoan.owed <= 0) {
+        acc.activeLoan = null;
+        return `\n\n🦈 *LOAN UPDATE* — ${sourceLabel} earned you ${fmtMoney(credited)}. Shark auto-deducted *${fmtMoney(deduct)}* and your debt is *CLEARED*! ✅`;
+    }
+    return `\n\n🦈 *LOAN UPDATE* — ${sourceLabel} earned you ${fmtMoney(credited)}. Shark took *${fmtMoney(deduct)}*. Remaining debt: *${fmtMoney(acc.activeLoan.owed)}*`;
+}
+
+// Same but for player-to-player loans (P2P)
+// Checks P2P loan collection — deducts from credited amount
+async function tryDeductP2PLoans(db, acc, credited) {
+    // Find active P2P loans where this player is the borrower
+    const loans = await db.collection('weirdo_p2ploans').find({ borrowerId: acc._id, status: 'active' }).toArray();
+    if (!loans.length) return '';
+    let msgs = [];
+    let remaining = credited;
+    for (const loan of loans) {
+        if (remaining <= 0) break;
+        // Apply compound interest first
+        const hoursElapsed = (Date.now() - (loan.lastCompound || loan.takenAt)) / 3600000;
+        const ticks = Math.floor(hoursElapsed);
+        if (ticks > 0) {
+            let owed = loan.owed;
+            for (let i = 0; i < ticks; i++) owed = Math.ceil(owed * (1 + loan.ratePerHour));
+            loan.owed         = owed;
+            loan.lastCompound = Date.now();
+        }
+        const deduct = Math.min(remaining, loan.owed, acc.money);
+        if (deduct <= 0) continue;
+        acc.money    -= deduct;
+        loan.owed    -= deduct;
+        remaining    -= deduct;
+        const cleared = loan.owed <= 0;
+        if (cleared) loan.status = 'paid';
+        await db.collection('weirdo_p2ploans').updateOne({ _id: loan._id }, { $set: { owed: loan.owed, status: loan.status, lastCompound: loan.lastCompound } });
+        // Credit the lender
+        await db.collection('weirdo_rpg').updateOne({ _id: loan.lenderId }, { $inc: { money: deduct } });
+        msgs.push(`🤝 *P2P Loan* — @${loan.lenderId} took *${fmtMoney(deduct)}*${cleared ? ` — debt *CLEARED*! ✅` : ` — still owe ${fmtMoney(loan.owed)}`}`);
+    }
+    return msgs.length ? '\n\n' + msgs.join('\n') : '';
+}
+
+
+cast({ pattern: "bank", desc: "Deposit or withdraw safe money", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const senderId   = await getPlayerId(conn, m.sender);
       const CREATOR_ID = '2348084644182';
@@ -570,13 +683,18 @@ cmd({ pattern: "bank", desc: "Deposit or withdraw safe money", category: "rpg", 
 
       if (action === "deposit") {
         if (acc.money < amount) return reply(`Not enough cash. Wallet: ${fmtMoney(acc.money)}`);
+        // ANTI-EXPLOIT: Can't shelter loan money in bank
+        if (acc.activeLoan && acc.activeLoan.owed > 0) {
+            const maxDeposit = Math.floor(acc.money * 0.50); // can only bank 50% if in debt
+            if (amount > maxDeposit) return reply(`🦈 *Blocked* — You have an outstanding loan of ${fmtMoney(acc.activeLoan.owed)}. You can only deposit 50% of your wallet (${fmtMoney(maxDeposit)}) while in debt.\nPay off your loan first: *loan pay all*`);
+        }
         acc.money -= amount; acc.bank += amount;
         logFinancial(acc, `Bank deposit${isCreatorAction?' (creator)':''}`, -amount);
         await saveAccount(acc);
         return reply(`✅ ${isCreatorAction?`Deposited ${fmtMoney(amount)} for @${id}.`:`Deposited ${fmtMoney(amount)}.`}\nWallet: ${fmtMoney(acc.money)} | Bank: ${fmtMoney(acc.bank)}`);
       } else {
         if (acc.bank < amount) return reply(`Not enough in bank. Bank: ${fmtMoney(acc.bank)}`);
-        acc.bank -= amount; acc.money += amount;
+        acc.bank -= amount; acc.money = Math.min(999000000000, (acc.money||0) + amount);
         logFinancial(acc, `Bank withdraw${isCreatorAction?' (creator)':''}`, amount);
         await saveAccount(acc);
         return reply(`✅ ${isCreatorAction?`Withdrew ${fmtMoney(amount)} for @${id}.`:`Withdrew ${fmtMoney(amount)}.`}\nWallet: ${fmtMoney(acc.money)} | Bank: ${fmtMoney(acc.bank)}`);
@@ -585,7 +703,7 @@ cmd({ pattern: "bank", desc: "Deposit or withdraw safe money", category: "rpg", 
 });
 
 // PAYDAY
-cmd({ pattern: "payday", desc: "Claim economy daily", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+cast({ pattern: "payday", desc: "Claim economy daily", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
   try {
       const id = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -596,28 +714,49 @@ cmd({ pattern: "payday", desc: "Claim economy daily", category: "rpg", filename:
       const last = acc.cooldowns?.payday || 0;
       if (now() - last < DAY) return reply(`⏳ The bank is processing your paycheck. Return in ${msToTime(DAY - (now() - last))}`);
 
-      const gross = 5000 + Math.floor(Math.random() * 10000);
+      const gross = 1000 + Math.floor(Math.random() * 2000);
       const { net: reward, vat } = applyVAT(gross);
-      acc.money += reward;
+      acc.money = capBalance((acc.money||0) + reward);
+      const paydayLoanMsg = tryDeductLoan(acc, reward, 'Payday');
+      acc.totalEarned = (acc.totalEarned||0) + reward;
+      // Referral cut (async, non-blocking)
+      if (acc.referredBy) {
+          const joinedAt = acc.bornAt || (acc.createdAt ? new Date(acc.createdAt).getTime() : 0);
+          if (Date.now() - joinedAt < 7*24*60*60*1000) {
+              const cut = Math.floor(reward * 0.05);
+              if (cut > 0) {
+                  const db = await connectDB();
+                  await db.collection('weirdo_rpg').updateOne({ _id: acc.referredBy }, { $inc: { money: cut, referralEarnings: cut } }).catch(()=>{});
+              }
+          }
+      }
 
       acc.cooldowns = acc.cooldowns || {};
       acc.cooldowns.payday = now();
 
       const leveled = await addExp(acc, 25);
       logFinancial(acc, `Daily Payday`, reward);
-      return reply(`💼 *PAYDAY!* Gross: ${fmtMoney(gross)} — 🏛️ VAT (12%): -${fmtMoney(vat)} = *${fmtMoney(reward)}* + 25 XP!${leveled ? `\n🎉 Level Up! You are now level ${acc.level}!` : ''}`);
+      return reply(`💼 *PAYDAY!* Gross: ${fmtMoney(gross)} — 🏛️ VAT: -${fmtMoney(vat)} = *${fmtMoney(reward)}* + 25 XP!${leveled ? `\n🎉 Level Up! You are now level ${acc.level}!` : ''}${paydayLoanMsg}`);
   } catch(e) { console.error(e); }
 });
 
 // SHIFTS
-cmd({ pattern: "shifts", desc: "List available tier jobs", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
-  let out = "🏢 *Corporate & Street Shifts:*\n_Require RPG Experience (XP) to unlock._\n\n";
-  for (const j of JOBS) out += `• *${j.name.replace(/_/g," ").toUpperCase()}* — Pays ${fmtMoney(j.min)}-${fmtMoney(j.max)} (Req: ${j.expReq} XP)\n`;
-  out += "\n*Command:* shift <job name>";
-  return reply(out);
+cast({ pattern: "shifts", desc: "List available tier jobs", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+  try {
+      const acc = await getAccount(await getPlayerId(conn, m.sender)).catch(()=>null);
+      let out = "👔 *AVAILABLE SHIFTS*\n_✅ = available  🔒 = locked_\n_⏳ 6-hour cooldown between shifts_\n\n";
+      for (const j of JOBS) {
+          const locked = !acc || (acc.level||1) < (j.levelReq||1) || (acc.exp||0) < j.expReq
+                      || (j.statReq && (acc[j.statReq.stat]||0) < j.statReq.min)
+                      || (j.degreeReq && !(acc.degrees||[]).some(d=>d.startsWith(j.degreeReq)));
+          out += `${locked?'🔒':'✅'} *${j.name.toUpperCase()}* — ${fmtMoney(j.min)}-${fmtMoney(j.max)}\n   ${j.note||''}\n\n`;
+      }
+      out += "*Command:* shift <job name>";
+      return reply(out);
+  } catch(e) { console.error('shifts error', e); }
 });
 
-cmd({ pattern: "shift", desc: "Work a shift", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "shift", desc: "Work a shift", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -625,42 +764,76 @@ cmd({ pattern: "shift", desc: "Work a shift", category: "rpg", filename: __filen
       if (isKidnapped(acc)) return reply(`🔒 You are kidnapped. You can't work right now.`);
       if (isInFlight(acc)) return reply(`✈️ You're in-flight to ${acc.travelingTo}. Work when you land.`);
 
-      const COOLDOWN = 30*60*1000;
+      const COOLDOWN = 6*60*60*1000; // 6 hours
       const last = acc.cooldowns?.shift || 0;
-      if (now() - last < COOLDOWN) return reply(`⏳ You are tired. Shift starts in ${msToTime(COOLDOWN - (now() - last))}`);
+      if (now() - last < COOLDOWN) return reply(`⏳ You are tired. Shift starts in ${msToTime(COOLDOWN - (now() - last))})`);
 
       let chosen;
       const requested = (args.join(" ") || "").toLowerCase();
-      if (requested) {
-        chosen = JOBS.find(j => j.name === requested);
-        if (!chosen) return reply("Job not found. Use `shifts` to list available jobs.");
-        if ((acc.exp || 0) < chosen.expReq) return reply(`❌ You lack experience. You need ${chosen.expReq} XP for this position.`);
-      } else {
-        const possible = JOBS.filter(j => (acc.exp || 0) >= j.expReq);
-        chosen = possible[Math.floor(Math.random() * possible.length)];
+      function meetsJobReq(acc, j) {
+          if ((acc.exp || 0) < j.expReq) return { ok: false, reason: `Need ${j.expReq} XP` };
+          if ((acc.level || 1) < (j.levelReq || 1)) return { ok: false, reason: `Need Level ${j.levelReq}` };
+          if (j.statReq) {
+              const statVal = acc[j.statReq.stat] || 0;
+              if (statVal < j.statReq.min) return { ok: false, reason: `Need ${j.statReq.min} ${j.statReq.stat} (you have ${statVal})` };
+          }
+          if (j.degreeReq) {
+              const hasDeg = (acc.degrees || []).some(d => d.startsWith(j.degreeReq));
+              if (!hasDeg) return { ok: false, reason: `Need a ${j.degreeReq} degree (*enroll ${j.degreeReq}*)` };
+          }
+          return { ok: true };
       }
 
-      // Live wages — scale with global wage index (shared from torn.js market engine)
-      const wageM = global.WAGE_INDEX ?? 1.0;
-      const gross = Math.ceil((chosen.min + Math.floor(Math.random()*(chosen.max - chosen.min + 1))) * wageM);
+      if (requested) {
+          chosen = JOBS.find(j => j.name.toLowerCase() === requested.toLowerCase());
+          if (!chosen) return reply("Job not found. Use *shifts* to list available jobs.");
+          const req = meetsJobReq(acc, chosen);
+          if (!req.ok) return reply(`❌ *${chosen.name}* — ${req.reason}.`);
+      } else {
+          const possible = JOBS.filter(j => meetsJobReq(acc, j).ok);
+          if (!possible.length) return reply(`No shifts available. Train your stats or level up.`);
+          chosen = possible[Math.floor(Math.random() * possible.length)];
+      }
+
+      // Live wages — scale with global wage index + seasonal bonus
+      const wageM    = global.WAGE_INDEX ?? 1.0;
+      const baseWage = Math.ceil((chosen.min + Math.floor(Math.random()*(chosen.max - chosen.min + 1))) * wageM);
+      // Seasonal event bonus
+      const _sevt = (() => { const d=new Date(),m=d.getMonth()+1,day=d.getDate(); if(m===12&&day>=20)return 0.50; if(m===10&&day>=28)return 0; if(m===1&&day<=3)return 1.0; return 0; })();
+      const gross = Math.ceil(baseWage * (1 + _sevt));
       const wageTag = wageM > 1.15 ? ' 📈' : wageM < 0.85 ? ' 📉' : '';
       const { net: pay, vat } = applyVAT(gross);
-      acc.money += pay;
+      acc.money = capBalance((acc.money||0) + pay);
       addTaxableIncome(acc, pay);
-      acc.jobsDone = (acc.jobsDone || 0) + 1;
+      acc.jobsDone    = (acc.jobsDone || 0) + 1;
+      acc.manualLabor = (acc.manualLabor||0) + Math.ceil(pay/10000);
+      acc.endurance   = (acc.endurance||0) + 1;
+      acc.totalEarned = (acc.totalEarned||0) + pay;
+      // Tick daily challenge
+      const _today = new Date().toISOString().split('T')[0];
+      if (acc.dailyChallenge?.date === _today) {
+          for (const t of acc.dailyChallenge.tasks||[]) {
+              if (!t.done) {
+                  if (t.key==='shifts') { t.progress=(t.progress||0)+1; if(t.progress>=t.target)t.done=true; }
+                  if (t.key==='earned') { t.progress=(t.progress||0)+pay; if(t.progress>=t.target)t.done=true; }
+              }
+          }
+      }
 
       acc.cooldowns = acc.cooldowns || {};
       acc.cooldowns.shift = now();
 
+      const shiftLoanMsg = tryDeductLoan(acc, pay, `${chosen.name} shift`);
       const leveled = await addExp(acc, Math.floor(pay/100) + 5);
       logFinancial(acc, `Shift: ${chosen.name}`, pay);
-      return reply(`👔 *${chosen.name.toUpperCase()}* shift complete!${wageTag}\nGross: ${fmtMoney(gross)} | 🏛️ VAT (12%): -${fmtMoney(vat)} | *Net: ${fmtMoney(pay)}*${leveled ? `\n🎉 Level Up! You are now level ${acc.level}!` : ''}`);
+      await saveAccount(acc);
+      return reply(`👔 *${chosen.name.toUpperCase()}* shift complete!${wageTag}\nGross: ${fmtMoney(gross)} | VAT: -${fmtMoney(vat)} | *Net: ${fmtMoney(pay)}*${leveled ? `\n🎉 Level Up! You are now level ${acc.level}!` : ''}${shiftLoanMsg}`);
   } catch(e) { console.error(e); }
 });
 
 // ROB — Strength-based outcome, crime bar tracking
 // ROB — same location, full stat-based outcome
-cmd({ pattern: "rob", desc: "rob @user (must be in same city)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "rob", desc: "rob @user (must be in same city)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const attackerId = await getPlayerId(conn, m.sender);
       const targetId   = await getTargetId(conn, mek, args, 0);
@@ -798,7 +971,7 @@ cmd({ pattern: "rob", desc: "rob @user (must be in same city)", category: "rpg",
 });
 
 // CALL COPS — Report a high-crime player for arrest
-cmd({ pattern: "callcops", desc: "callcops @user — Report a wanted criminal", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "callcops", desc: "callcops @user — Report a wanted criminal", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const callerId = await getPlayerId(conn, m.sender);
       const targetId = await getTargetId(conn, mek, args, 0);
@@ -821,7 +994,7 @@ cmd({ pattern: "callcops", desc: "callcops @user — Report a wanted criminal", 
       caller.cooldowns.callcops = now();
       await saveAccount(caller);
 
-      if (heat < 20) {
+      if (heat < 10) {
           return conn.sendMessage(m.chat, {
               text: `👮 You reported @${targetId} to the police.\n\nThe cops checked them out but their crime heat is too low (${heat}/100). No grounds for arrest.`,
               mentions: [toJid(targetId)]
@@ -829,14 +1002,20 @@ cmd({ pattern: "callcops", desc: "callcops @user — Report a wanted criminal", 
       }
 
       // Arrest chance scales with heat level
-      const arrestChance = Math.min(0.90, 0.30 + (heat - 20) * 0.0075);
+      const arrestChance = Math.min(0.90, 0.30 + (heat - 10) * 0.0075);
       const arrested = Math.random() < arrestChance;
 
       if (arrested) {
-          // Jail time proportional to crime heat (1 min per 2 heat points, min 5 min)
-          const jailMs = Math.max(5 * 60 * 1000, Math.floor(heat * 30000)); // heat * 30s, max ~50min at 100
-          target.jailedUntil = now() + jailMs;
-          target.crimeLevel = 0;
+          const hasLawDeg  = (target.degrees || []).some(d => d.startsWith('law_'));
+          const jailReduce = hasLawDeg ? 0.80 : 1.0;
+          const jailMs = Math.max(5 * 60 * 1000, Math.floor(heat * 30000 * jailReduce));
+          target.jailedUntil     = now() + jailMs;
+          target.inJail          = true;
+          target.jailWorkDone    = 0;
+          target.lawyerCallUsed  = false;
+          target.sentencedAt     = now();
+          target.sentenceMs      = jailMs;
+          target.crimeLevel      = 0;
           target.lastCrimeLevelDecay = now();
 
           // Caller gets a reward
@@ -864,94 +1043,298 @@ cmd({ pattern: "callcops", desc: "callcops @user — Report a wanted criminal", 
 });
 
 // BLACKMARKET
-cmd({ pattern: "blackmarket", desc: "View underworld items", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+cast({ pattern: "bm", desc: "View underworld items (alias: blackmarket)", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
   let out = "🌑 *THE BLACKMARKET*\n_No questions asked._\n\n";
   for (const k of Object.keys(BLACKMARKET)) {
       out += `• *${k}* — ${fmtMoney(BLACKMARKET[k].price)}\n  ↳ _${BLACKMARKET[k].desc}_\n\n`;
   }
-  out += "*Command:* deal <item>";
+  out += "*Command:* underworld <item>  (or use *deal <number>* for torn's black market)";
   return reply(out);
 });
 
-cmd({ pattern: "deal", desc: "buy from blackmarket", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "underworld", desc: "Buy from black market (alias: deal)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const item = (args[0] || "").toLowerCase();
-      if (!BLACKMARKET[item]) return reply("Item not found in the blackmarket.");
+      if (!BLACKMARKET[item]) return reply(`Item not found. Use *bm* to browse available items.`);
 
       const id = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
 
-      const bmPrice = Math.ceil(BLACKMARKET[item].price * (global.ECON_INDEX ?? 1.0));
+      const bmPrice = Math.ceil(BLACKMARKET[item].price * (global.ECON_INDEX ?? 1.0) * (global.INFLATION_MULT ?? 1));
       if (acc.money < bmPrice) return reply(`You don't have enough cash. Costs ${fmtMoney(bmPrice)}.`);
 
       acc.money -= bmPrice;
       acc.moneySpent = (acc.moneySpent || 0) + bmPrice;
-      acc.inventory[item] = (acc.inventory[item] || 0) + 1;
+      logFinancial(acc, `🌑 Blackmarket: ${item}`, -bmPrice);
 
+      let effectMsg = '';
+      // Apply immediate effects where applicable
+      if (item === 'medkit') {
+          // Medkit: heal and possibly discharge from hospital
+          const healAmt = Math.floor(5 + Math.random() * 6);
+          acc.health = Math.min(acc.maxHealth || 100, (acc.health || 100) + healAmt);
+          if (!acc.inJail && acc.health >= 40 && acc.jailedUntil > now()) {
+              acc.jailedUntil = 0;
+              effectMsg = `\n✅ +${healAmt} HP — Discharged from hospital!`;
+          } else {
+              effectMsg = `\n❤️ +${healAmt} HP (${acc.health}/${acc.maxHealth || 100})`;
+              acc.inventory = acc.inventory || {};
+              acc.inventory[item] = (acc.inventory[item] || 0) + 1;
+          }
+      } else if (item === 'luckycharm') {
+          // Lucky charm: store in inventory, auto-consumed in rob/wager/gamble
+          acc.inventory = acc.inventory || {};
+          acc.inventory[item] = (acc.inventory[item] || 0) + 1;
+          effectMsg = `\n🍀 Lucky charm stored — auto-activates in your next rob, wager, or gamble!`;
+      } else if (item === 'lockpick') {
+          // Lockpick: store in inventory, auto-consumed in rob
+          acc.inventory = acc.inventory || {};
+          acc.inventory[item] = (acc.inventory[item] || 0) + 1;
+          effectMsg = `\n🔓 Lockpick stored — auto-activates in your next robbery for +15 success!`;
+      } else {
+          acc.inventory = acc.inventory || {};
+          acc.inventory[item] = (acc.inventory[item] || 0) + 1;
+      }
+
+      logFinancial(acc, `BM purchase: ${item}`, -bmPrice);
       await saveAccount(acc);
-      return reply(`🤝 Deal done. You purchased 1x *${item}* for ${fmtMoney(bmPrice)}.`);
+      return reply(`🤝 Deal done. You purchased 1x *${item}* for ${fmtMoney(bmPrice)}.${effectMsg}`);
   } catch(e) { console.error(e); }
 });
 
 // INVEST
-cmd({ pattern: "invest", desc: "invest <amount> [1h|6h|24h]", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+// =============================================================================
+// INVESTMENT SLOTS — Up to 5 named slots, each with progress tracking
+// invest <slot> <amount> <term> — invest 1 50000 6h
+// invest status                 — see all slots with P&L and time left
+// invest withdraw <slot>        — pull out early (lose 20% as penalty)
+// invest claim <slot>           — collect matured investment
+// =============================================================================
+const MAX_INV_SLOTS = 5;
+const INV_TERMS = {
+    '30m':  { ms: 30*60*1000,    baseRate: 0.02,  label: '30 min' },
+    '1h':   { ms: 60*60*1000,    baseRate: 0.05,  label: '1 hour' },
+    '3h':   { ms: 3*60*60*1000,  baseRate: 0.12,  label: '3 hours' },
+    '6h':   { ms: 6*60*60*1000,  baseRate: 0.22,  label: '6 hours' },
+    '12h':  { ms: 12*60*60*1000, baseRate: 0.38,  label: '12 hours' },
+    '24h':  { ms: 24*60*60*1000, baseRate: 0.60,  label: '24 hours' },
+};
+
+cast({ pattern: "invest", desc: "invest status | invest <slot> <amount> <term> | invest claim/withdraw <slot>", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
-      const senderId   = await getPlayerId(conn, m.sender);
-      const CREATOR_ID = '2348084644182';
-      let id = senderId;
-      if (senderId === CREATOR_ID) {
-          const t = await getTargetId(conn, mek, args, 0).catch(() => null);
-          if (t && t !== senderId) id = t;
-      }
+      const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
-      if (id === senderId && isHospitalized(acc)) return reply(`🚨 You are incarcerated.`);
-      if (id === senderId && isKidnapped(acc)) return reply(`🔒 You are kidnapped.`);
+      if (isHospitalized(acc)) return reply(`🚨 Action restricted.`);
+      if (isKidnapped(acc))    return reply(`🔒 You are kidnapped.`);
 
-      const amount = parseInt(args[0]);
-      if (!amount || amount <= 0) return reply("Usage: invest <amount> [1h|6h|24h]");
-      if (acc.money < amount) return reply(`Not enough wallet balance. Have: ${fmtMoney(acc.money)}`);
+      // Ensure investments array has slot structure
+      if (!Array.isArray(acc.investments)) acc.investments = [];
+      // Migrate old flat investments to slot format
+      acc.investments = acc.investments.map((inv, i) => {
+          if (!inv.slot) return { ...inv, slot: i + 1 };
+          return inv;
+      });
 
-      const term = args[1] === "1h" ? 3600000 : args[1] === "6h" ? 6*3600000 : 24*3600000;
+      const sub = (args[0] || 'status').toLowerCase();
+      const nowTs = now();
       const econM = Math.max(0.4, Math.min(2.0, global.ECON_INDEX ?? 1.0));
-      const rate = term === 3600000 ? +(0.05 * econM).toFixed(4) : term === 6*3600000 ? +(0.18 * econM).toFixed(4) : +(0.5 * econM).toFixed(4);
-      const econLabel2 = econM > 1.3 ? ' 📈 (bull market!)' : econM < 0.7 ? ' 📉 (bear market)' : '';
+      const econLabel = econM > 1.3 ? '📈 Bull Market' : econM < 0.7 ? '📉 Bear Market' : '📊 Stable';
+
+      // ── STATUS ──────────────────────────────────────────────────────────────
+      if (sub === 'status' || sub === 'slots') {
+          const lines = [`💼 *INVESTMENT PORTFOLIO*`, `Market: ${econLabel}`, ``];
+          for (let slot = 1; slot <= MAX_INV_SLOTS; slot++) {
+              const inv = acc.investments.find(i => i.slot === slot);
+              if (!inv) {
+                  lines.push(`[Slot ${slot}] ⬜ *Empty* — invest ${slot} <amount> <term>`);
+              } else {
+                  const elapsed   = nowTs - inv.boughtAt;
+                  const progress  = Math.min(1, elapsed / inv.termMs);
+                  const matured   = elapsed >= inv.termMs;
+                  const timeLeft  = matured ? 0 : inv.termMs - elapsed;
+                  // Current value = principal + accrued interest (linear)
+                  const accrued   = Math.floor(inv.amount * inv.rate * progress);
+                  const currentVal = inv.amount + accrued;
+                  const finalVal  = Math.floor(inv.amount * (1 + inv.rate));
+                  const plPct     = ((currentVal - inv.amount) / inv.amount * 100).toFixed(1);
+                  const bar       = '█'.repeat(Math.floor(progress * 10)) + '░'.repeat(10 - Math.floor(progress * 10));
+                  lines.push(`[Slot ${slot}] ${matured ? '✅ *MATURE*' : '⏳ *Active*'}`);
+                  lines.push(`  💵 Invested: ${fmtMoney(inv.amount)} | Now: ${fmtMoney(currentVal)} (+${plPct}%)`);
+                  lines.push(`  🎯 At maturity: ${fmtMoney(finalVal)} | Rate: ${(inv.rate*100).toFixed(1)}%`);
+                  lines.push(`  ${bar} ${matured ? 'Ready!' : msToTime(timeLeft) + ' left'}`);
+                  lines.push(matured
+                      ? `  → *invest claim ${slot}* to collect`
+                      : `  → *invest withdraw ${slot}* (−20% early penalty)`);
+              }
+              lines.push('');
+          }
+          lines.push(`Terms: ${Object.entries(INV_TERMS).map(([k,v])=>`${k}(${(v.baseRate*econM*100).toFixed(0)}%)`).join(' | ')}`);
+          return reply(lines.join('\n'));
+      }
+
+      // ── CLAIM ────────────────────────────────────────────────────────────────
+      if (sub === 'claim') {
+          const slot = parseInt(args[1]);
+          if (!slot || slot < 1 || slot > MAX_INV_SLOTS) return reply(`Usage: invest claim <slot 1-${MAX_INV_SLOTS}>`);
+          const idx = acc.investments.findIndex(i => i.slot === slot);
+          if (idx === -1) return reply(`❌ Slot ${slot} is empty.`);
+          const inv = acc.investments[idx];
+          if (nowTs - inv.boughtAt < inv.termMs) {
+              const left = inv.termMs - (nowTs - inv.boughtAt);
+              return reply(`⏳ Slot ${slot} isn't mature yet. ${msToTime(left)} remaining.\nUse *invest withdraw ${slot}* to exit early (−20% penalty).`);
+          }
+          // ── Market risk — longer terms carry higher loss chance ──────────────
+          const econM2 = Math.max(0.4, Math.min(2.0, global.ECON_INDEX ?? 1.0));
+          // Bear market = more risk; bull = less. Term > 12h = higher exposure.
+          const baseRisk   = econM2 < 0.7 ? 0.35 : econM2 < 1.0 ? 0.18 : 0.08;
+          const termRisk   = inv.termMs >= 24*60*60*1000 ? 0.12 : inv.termMs >= 12*60*60*1000 ? 0.07 : inv.termMs >= 6*60*60*1000 ? 0.04 : 0.01;
+          const totalRisk  = Math.min(0.45, baseRisk + termRisk);
+          const roll       = Math.random();
+
+          if (roll < totalRisk * 0.4) {
+              // Total loss — market crashed
+              acc.investments.splice(idx, 1);
+              await saveAccount(acc);
+              return reply([
+                  `📉 *INVESTMENT LOST — Slot ${slot}*`, ``,
+                  `The market collapsed on your position.`,
+                  `💸 Lost: *${fmtMoney(inv.amount)}*`,
+                  `💰 Balance: ${fmtMoney(acc.money)}`,
+                  `_Risk is real. Not every investment pays off._`
+              ].join('\n'));
+          } else if (roll < totalRisk) {
+              // Partial loss — returned only 50-85% of principal, no profit
+              const returnPct = 0.50 + Math.random() * 0.35;
+              const returned  = Math.floor(inv.amount * returnPct);
+              const lost      = inv.amount - returned;
+              acc.money += returned;
+              logFinancial(acc, `Investment slot ${slot} partial loss`, -lost);
+              acc.investments.splice(idx, 1);
+              await saveAccount(acc);
+              return reply([
+                  `📉 *INVESTMENT UNDERPERFORMED — Slot ${slot}*`, ``,
+                  `Market conditions were unfavourable.`,
+                  `💸 Principal lost: *-${fmtMoney(lost)}*`,
+                  `💵 Recovered: *${fmtMoney(returned)}* (${(returnPct*100).toFixed(0)}% of principal)`,
+                  `💰 Balance: ${fmtMoney(acc.money)}`
+              ].join('\n'));
+          }
+
+          // Success path (majority of the time)
+          const payout = Math.floor(inv.amount * (1 + inv.rate));
+          const profit  = payout - inv.amount;
+          acc.money += payout;
+          addTaxableIncome(acc, profit);
+          logFinancial(acc, `Investment slot ${slot} matured`, profit);
+          acc.investments.splice(idx, 1);
+          await saveAccount(acc);
+          return reply([
+              `✅ *INVESTMENT CLAIMED — Slot ${slot}*`, ``,
+              `Principal: ${fmtMoney(inv.amount)}`,
+              `Profit: *+${fmtMoney(profit)}* (${(inv.rate*100).toFixed(1)}%)`,
+              `Total paid out: *${fmtMoney(payout)}*`,
+              `💰 New balance: ${fmtMoney(acc.money)}`
+          ].join('\n'));
+      }
+
+      // ── WITHDRAW (early exit, 20% penalty) ──────────────────────────────────
+      if (sub === 'withdraw') {
+          const slot = parseInt(args[1]);
+          if (!slot || slot < 1 || slot > MAX_INV_SLOTS) return reply(`Usage: invest withdraw <slot 1-${MAX_INV_SLOTS}>`);
+          const idx = acc.investments.findIndex(i => i.slot === slot);
+          if (idx === -1) return reply(`❌ Slot ${slot} is empty.`);
+          const inv = acc.investments[idx];
+          if (nowTs - inv.boughtAt >= inv.termMs) return reply(`✅ Slot ${slot} is already mature! Use *invest claim ${slot}*.`);
+          const PENALTY = 0.20;
+          const returned = Math.floor(inv.amount * (1 - PENALTY));
+          const lost = inv.amount - returned;
+          acc.money += returned;
+          logFinancial(acc, `Investment slot ${slot} early withdrawal (penalty)`, -lost);
+          acc.investments.splice(idx, 1);
+          await saveAccount(acc);
+          return reply([
+              `💸 *EARLY WITHDRAWAL — Slot ${slot}*`, ``,
+              `Original: ${fmtMoney(inv.amount)}`,
+              `Penalty (20%): -${fmtMoney(lost)}`,
+              `Returned: *${fmtMoney(returned)}*`,
+              `💰 New balance: ${fmtMoney(acc.money)}`
+          ].join('\n'));
+      }
+
+      // ── NEW INVESTMENT: invest <slot> <amount> <term> ────────────────────────
+      const slot   = parseInt(args[0]);
+      const amount = parseInt(args[1]);
+      const termKey = (args[2] || '6h').toLowerCase();
+
+      if (!slot || slot < 1 || slot > MAX_INV_SLOTS || !amount || amount <= 0) {
+          return reply([
+              `📈 *INVESTMENT SLOTS*`, ``,
+              `*Open new:*  invest <slot 1-5> <amount> <term>`,
+              `*View all:*  invest status`,
+              `*Collect:*   invest claim <slot>`,
+              `*Exit early: invest withdraw <slot>* (−20% penalty)`, ``,
+              `Terms: ${Object.entries(INV_TERMS).map(([k,v])=>`${k}=${(v.baseRate*econM*100).toFixed(0)}%`).join(' | ')}`
+          ].join('\n'));
+      }
+
+      const termDef = INV_TERMS[termKey];
+      if (!termDef) return reply(`Invalid term. Choose: ${Object.keys(INV_TERMS).join(' | ')}`);
+
+      const existing = acc.investments.find(i => i.slot === slot);
+      if (existing) return reply(`❌ Slot ${slot} is occupied. Claim or withdraw it first.`);
+      if (acc.investments.length >= MAX_INV_SLOTS) return reply(`❌ All ${MAX_INV_SLOTS} investment slots are full.`);
+      if (acc.money < amount) return reply(`Not enough cash. Have: ${fmtMoney(acc.money)}`);
+      if (amount < 1000) return reply(`Minimum investment is ${fmtMoney(1000)}.`);
+
+      const rate = +(termDef.baseRate * econM).toFixed(4);
+      const projectedReturn = Math.floor(amount * (1 + rate));
 
       acc.money -= amount;
-      acc.investments.push({ amount, boughtAt: now(), termMs: term, rate });
+      acc.investments.push({ slot, amount, boughtAt: nowTs, termMs: termDef.ms, rate, term: termKey });
+      logFinancial(acc, `Investment slot ${slot} opened (${termKey})`, -amount);
       await saveAccount(acc);
-      return reply(`📈 ${id!==senderId?`Invested for @${id}: `:''}${fmtMoney(amount)} in Wall Street for ${term===3600000?"1h":term===6*3600000?"6h":"24h"} at ${(rate*100).toFixed(1)}% yield.${econLabel2}`);
-  } catch(e) { console.error(e); }
+      return reply([
+          `📈 *SLOT ${slot} OPENED*`, ``,
+          `Invested: *${fmtMoney(amount)}*`,
+          `Term: *${termDef.label}* | Rate: *${(rate*100).toFixed(1)}%*`,
+          `Projected return: *${fmtMoney(projectedReturn)}* (+${fmtMoney(projectedReturn - amount)})`,
+          `Market: ${econLabel}`,
+          `Matures: ${new Date(nowTs + termDef.ms).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'})}`,
+          ``,
+          `Use *invest status* to track progress.`
+      ].join('\n'));
+  } catch(e) { console.error('invest error', e); }
 });
 
-cmd({ pattern: "claim", desc: "Claim mature investments", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "claim", desc: "Alias: invest claim <slot>", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+  // Redirect to invest claim for backward compat
+  args.unshift('claim');
+  m.args = args;
   try {
-      const senderId   = await getPlayerId(conn, m.sender);
-      const CREATOR_ID = '2348084644182';
-      let id = senderId;
-      if (senderId === CREATOR_ID) {
-          const t = await getTargetId(conn, mek, args, 0).catch(() => null);
-          if (t && t !== senderId) id = t;
-      }
+      const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
-      const nowTs = now();
-      const matured = [], remaining = [];
-      for (const inv of acc.investments || []) {
-        if (nowTs - inv.boughtAt >= inv.termMs) matured.push(inv);
-        else remaining.push(inv);
+      const slot = parseInt(args[1]);
+      if (!slot) {
+          // Old behavior: claim all matured
+          const nowTs = now();
+          const matured = acc.investments.filter(i => nowTs - i.boughtAt >= i.termMs);
+          if (!matured.length) return reply(`No matured investments. Use *invest status* to check.`);
+          let total = 0, profits = 0;
+          for (const inv of matured) {
+              const pay = Math.floor(inv.amount * (1 + inv.rate));
+              total += pay; profits += pay - inv.amount;
+          }
+          acc.money += total;
+          addTaxableIncome(acc, profits);
+          acc.investments = acc.investments.filter(i => nowTs - i.boughtAt < i.termMs);
+          await saveAccount(acc);
+          return reply(`💸 Claimed ${matured.length} matured investments: *${fmtMoney(total)}*`);
       }
-      if (matured.length === 0) return reply(`📈 ${id!==senderId?`@${id} has`:'You have'} no mature investments to claim yet.`);
-      let total = 0;
-      for (const i of matured) total += Math.floor(i.amount * (1 + i.rate));
-      acc.money += total;
-      addTaxableIncome(acc, total);
-      acc.investments = remaining;
-      await saveAccount(acc);
-      return reply(`💸 ${id!==senderId?`Claimed for @${id}: `:''}Wall Street paid out *${fmtMoney(total)}*!`);
   } catch(e) { console.error(e); }
 });
 
 // WAGER
-cmd({ pattern: "wager", desc: "wager <amount>", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "wager", desc: "wager <amount>", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -966,7 +1349,7 @@ cmd({ pattern: "wager", desc: "wager <amount>", category: "rpg", filename: __fil
       const last = acc.cooldowns?.wager || 0;
       if (now() - last < COOLDOWN) return reply(`⏳ Wait ${msToTime(COOLDOWN - (now() - last))} before tossing the dice again.`);
 
-      let winChance = 0.45;
+      let winChance = 0.38;
       let charmMsg = '';
 
       if (acc.inventory['luckycharm'] && acc.inventory['luckycharm'] > 0) {
@@ -979,7 +1362,7 @@ cmd({ pattern: "wager", desc: "wager <amount>", category: "rpg", filename: __fil
       acc.cooldowns.wager = now();
 
       if (Math.random() < winChance) {
-        const profit = Math.floor(amount * (1 + Math.random()*1.5));
+        const profit = Math.floor(amount * (1 + Math.random()*0.7));
         acc.money += profit;
         addTaxableIncome(acc, profit);
         await saveAccount(acc);
@@ -993,7 +1376,7 @@ cmd({ pattern: "wager", desc: "wager <amount>", category: "rpg", filename: __fil
 });
 
 // WIRE
-cmd({ pattern: "wire", desc: "wire @user <amount>", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "wire", desc: "wire @user <amount>", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const senderId   = await getPlayerId(conn, m.sender);
       const CREATOR_ID = '2348084644182';
@@ -1022,67 +1405,245 @@ cmd({ pattern: "wire", desc: "wire @user <amount>", category: "rpg", filename: _
 
       if (!isCreatorAction && isHospitalized(acc)) return reply(`🚨 Action restricted.`);
       if (!isCreatorAction && isKidnapped(acc)) return reply(`🔒 You are kidnapped.`);
-      if (acc.money < amount) return reply(`Insufficient funds. @${fromId} has ${fmtMoney(acc.money)}.`);
+      if (!isCreatorAction && (acc.money||0) < -100000) return reply(`🔴 *Blocked* — Wallet is ${fmtMoney(acc.money)}. Clear your debts before wiring money.`);
 
-      acc.money -= amount;
-      rec.money += amount;
-      logFinancial(acc, `Wire sent → @${targetId}${isCreatorAction?' (creator)':''}`, -amount);
+      // 30-second cooldown on wires to prevent spam transfers
+      if (!isCreatorAction) {
+          const lastWire = acc.lastWire || 0;
+          const WIRE_CD  = 30 * 1000;
+          if (now() - lastWire < WIRE_CD) return reply(`⏳ Wait ${Math.ceil((WIRE_CD-(now()-lastWire))/1000)}s before wiring again.`);
+      }
+      // P2P wire fee: 10% VAT on sender (receiver always gets full amount)
+      const wireFee = isCreatorAction ? 0 : Math.ceil(amount * 0.10);
+      const totalCost = amount + wireFee;
+      if (acc.money < totalCost) return reply(`Insufficient funds. Wire costs ${fmtMoney(amount)} + 10% fee (${fmtMoney(wireFee)}) = ${fmtMoney(totalCost)}. You have ${fmtMoney(acc.money)}.`);
+
+      acc.money -= totalCost;
+      rec.money = capBalance((rec.money||0) + amount);
+      logFinancial(acc, `Wire sent → @${targetId}${isCreatorAction?' (creator)':''}`, -totalCost);
       logFinancial(rec, `Wire received ← @${fromId}${isCreatorAction?' (creator)':''}`, amount);
 
+      if (!isCreatorAction) acc.lastWire = now();
       await saveAccount(acc); await saveAccount(rec);
-      return conn.sendMessage(m.chat, { text: `💸 ${isCreatorAction?`👑 Creator wired `:''}${fmtMoney(amount)} from @${fromId} to @${targetId}.`, mentions: [toJid(fromId), toJid(targetId)] }, { quoted: mek });
-  } catch(e) { console.error(e); }
-});
-
-// STATEMENT — Last 20 financial transactions
-cmd({ pattern: "statement", desc: "View last 20 financial transactions", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
-  try {
-      const senderId = await getPlayerId(conn, m.sender);
-      const CREATOR_ID = '2348084644182';
-
-      // Creator can view any player's statement
-      let id = senderId;
-      if (senderId === CREATOR_ID) {
-          const targetId = await getTargetId(conn, mek, args, 0).catch(() => null);
-          if (targetId && targetId !== senderId) id = targetId;
-      }
-
-      const acc = await getAccount(id);
-      const hist = acc.financialHistory || [];
-
-      if (hist.length === 0) {
-          return reply(`📊 ${id === senderId ? 'Your' : `@${id}'s`} financial statement is empty. Make some transactions first.`);
-      }
-
-      const label = id === senderId ? (acc.username || `@${id}`) : `@${id} 👑`;
-      const lines = [...hist].reverse().join('\n');
       return conn.sendMessage(m.chat, {
-          text: `📊 *Financial Statement — ${label}*\n_Last ${hist.length} transactions_\n\n${lines}`,
-          mentions: id !== senderId ? [toJid(id)] : []
+          text: `💸 ${isCreatorAction?`👑 Creator wired `:''}${fmtMoney(amount)} sent to @${targetId}.${isCreatorAction ? '' : `
+🏛️ Transfer fee (10%): -${fmtMoney(wireFee)}
+Total deducted: ${fmtMoney(totalCost)}`}`,
+          mentions: [toJid(fromId), toJid(targetId)]
       }, { quoted: mek });
   } catch(e) { console.error(e); }
 });
 
+// STATEMENT — Last 20 financial transactions
+// =============================================================================
+// WIRECRYPTO — Transfer crypto between players
+// Usage: wirecrypto @player <coin> <amount>
+// =============================================================================
+cast({ pattern: "wirecrypto", desc: "wirecrypto @player <coin> <amount> — Send crypto to another player", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+  try {
+      const senderId = await getPlayerId(conn, m.sender);
+      const acc      = await getAccount(senderId);
+      if (isHospitalized(acc)) return reply(`🚨 Can't transfer crypto right now.`);
+
+      const targetId = await getTargetId(conn, mek, args, 0);
+      const coin     = (args[1] || '').toUpperCase();
+      const amount   = parseFloat(args[2]);
+
+      if (!targetId || !coin || !amount || amount <= 0) return reply([
+          `🪙 *CRYPTO TRANSFER*`, ``,
+          `Usage: *wirecrypto @player <coin> <amount>*`,
+          `Example: wirecrypto @mark BTC 0.05`,
+          ``,
+          `Current coins: ${Object.keys(global.market||{}).join(', ')}`
+      ].join('\n'));
+
+      if (targetId === senderId) return reply(`You can't send crypto to yourself.`);
+      if (!global.market?.[coin]) return reply(`❌ Unknown coin *${coin}*. Use *crypto* to see available coins.`);
+
+      // Check sender's crypto balance
+      const senderCrypto = acc.cryptoPortfolio instanceof Map
+          ? acc.cryptoPortfolio
+          : new Map(Object.entries(acc.cryptoPortfolio || {}));
+
+      const owned = senderCrypto.get(coin) || 0;
+      if (owned < amount) return reply(`❌ You only have *${owned.toFixed(6)} ${coin}*. Can't send ${amount}.`);
+
+      // Deduct from sender
+      senderCrypto.set(coin, owned - amount);
+      acc.cryptoPortfolio = Object.fromEntries(senderCrypto);
+
+      // Add to recipient
+      const rec = await getAccount(targetId);
+      const recCrypto = rec.cryptoPortfolio instanceof Map
+          ? rec.cryptoPortfolio
+          : new Map(Object.entries(rec.cryptoPortfolio || {}));
+      recCrypto.set(coin, (recCrypto.get(coin) || 0) + amount);
+      rec.cryptoPortfolio = Object.fromEntries(recCrypto);
+
+      const usdValue = amount * (global.market[coin] || 0);
+      logFinancial(acc, `Crypto sent: ${amount.toFixed(6)} ${coin} → @${targetId}`, -Math.floor(usdValue));
+      logFinancial(rec, `Crypto received: ${amount.toFixed(6)} ${coin} ← @${senderId}`, Math.floor(usdValue));
+
+      await saveAccount(acc);
+      await saveAccount(rec);
+
+      return conn.sendMessage(m.chat, {
+          text: [
+              `🪙 *CRYPTO SENT*`, ``,
+              `Sent: *${amount.toFixed(6)} ${coin}*`,
+              `To: @${targetId}`,
+              `≈ ${fmtMoney(Math.floor(usdValue))} at current price`,
+              ``,
+              `Your ${coin} remaining: *${(owned - amount).toFixed(6)}*`
+          ].join('\n'),
+          mentions: [toJid(targetId)]
+      }, { quoted: mek });
+  } catch(e) { console.error('wirecrypto error', e); }
+});
+
+// =============================================================================
+// PAYWITHCRYPTO — Pay a player in crypto (they must be online and accept)
+// Usage: paycrypto @player <coin> <amount>
+// =============================================================================
+cast({ pattern: "paycrypto", desc: "paycrypto @player <coin> <amount> — Pay someone in crypto", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+  try {
+      const senderId = await getPlayerId(conn, m.sender);
+      const acc      = await getAccount(senderId);
+
+      const targetId = await getTargetId(conn, mek, args, 0);
+      const coin     = (args[1] || '').toUpperCase();
+      const amount   = parseFloat(args[2]);
+
+      if (!targetId || !coin || !amount || amount <= 0)
+          return reply(`Usage: *paycrypto @player <coin> <amount>*\nExample: paycrypto @mark ETH 0.1`);
+      if (!global.market?.[coin]) return reply(`❌ Unknown coin. Use *crypto* to see coins.`);
+
+      const senderCrypto = acc.cryptoPortfolio instanceof Map
+          ? acc.cryptoPortfolio : new Map(Object.entries(acc.cryptoPortfolio||{}));
+      const owned = senderCrypto.get(coin) || 0;
+      if (owned < amount) return reply(`❌ You only have ${owned.toFixed(6)} ${coin}.`);
+
+      // Direct transfer — no cooldown, no fee (crypto is instant)
+      senderCrypto.set(coin, owned - amount);
+      acc.cryptoPortfolio = Object.fromEntries(senderCrypto);
+
+      const rec = await getAccount(targetId);
+      const recCrypto = rec.cryptoPortfolio instanceof Map
+          ? rec.cryptoPortfolio : new Map(Object.entries(rec.cryptoPortfolio||{}));
+      recCrypto.set(coin, (recCrypto.get(coin)||0)+amount);
+      rec.cryptoPortfolio = Object.fromEntries(recCrypto);
+
+      const usdVal = Math.floor(amount * (global.market[coin]||0));
+      logFinancial(acc, `Crypto payment: ${amount.toFixed(6)} ${coin} to @${targetId}`, -usdVal);
+      logFinancial(rec, `Crypto payment received: ${amount.toFixed(6)} ${coin} from @${senderId}`, usdVal);
+
+      await saveAccount(acc); await saveAccount(rec);
+
+      return conn.sendMessage(m.chat, {
+          text: [`💸 *CRYPTO PAYMENT*`,``,`${amount.toFixed(6)} *${coin}* → @${targetId}`,`≈ ${fmtMoney(usdVal)}`].join('\n'),
+          mentions: [toJid(targetId)]
+      }, { quoted: mek });
+  } catch(e) { console.error('paycrypto error', e); }
+});
+
+cast({ pattern: "statement", desc: "View full financial statement — statement [page] | statement @player", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+  try {
+      const senderId   = await getPlayerId(conn, m.sender);
+      const CREATOR_ID = '2348084644182';
+
+      let id = senderId;
+      let pageArg = 1;
+
+      if (senderId === CREATOR_ID) {
+          const targetId = await getTargetId(conn, mek, args, 0).catch(() => null);
+          if (targetId && targetId !== senderId) {
+              id = targetId;
+              pageArg = parseInt(args[1]) || 1;
+          } else {
+              pageArg = parseInt(args[0]) || 1;
+          }
+      } else {
+          pageArg = parseInt(args[0]) || 1;
+      }
+
+      const acc  = await getAccount(id);
+      const hist = acc.financialHistory || [];
+
+      if (hist.length === 0) {
+          return reply([
+              `📊 *Financial Statement*`,
+              ``,
+              `No transactions on record yet.`,
+              `Every crime, job, purchase, attack, wire, tax, and investment is logged here.`
+          ].join('\n'));
+      }
+
+      const PER_PAGE   = 20;
+      const reversed   = [...hist].reverse(); // newest first
+      const totalPages = Math.ceil(reversed.length / PER_PAGE);
+      const page       = Math.max(1, Math.min(pageArg, totalPages));
+      const slice      = reversed.slice((page-1)*PER_PAGE, page*PER_PAGE);
+
+      // Calculate totals from full history
+      let totalIn = 0, totalOut = 0;
+      for (const entry of hist) {
+          const match = entry.match(/([+-])\$([\d,]+)/);
+          if (match) {
+              const val = parseInt(match[2].replace(/,/g,''));
+              if (match[1] === '+') totalIn  += val;
+              else                  totalOut += val;
+          }
+      }
+
+      const label = id === senderId ? (acc.username || `Player`) : `@${id}`;
+      const lines = [
+          `📊 *Financial Statement — ${label}*`,
+          `💰 Balance: ${fmtMoney(acc.money)} | 🏦 Bank: ${fmtMoney(acc.bank||0)}`,
+          `📈 Total in: ${fmtMoney(totalIn)} | 📉 Total out: ${fmtMoney(totalOut)}`,
+          `_Page ${page}/${totalPages} — ${hist.length} entries (newest first)_`,
+          ``,
+          ...slice,
+          ``,
+          page < totalPages ? `_Next page: statement ${page+1}_` : `_Showing all entries_`
+      ];
+
+      return conn.sendMessage(m.chat, {
+          text: lines.join('\n'),
+          mentions: id !== senderId ? [toJid(id)] : []
+      }, { quoted: mek });
+  } catch(e) { console.error('statement error', e); }
+});
+
 // LEADERBOARD
-cmd({ pattern: "econboard", desc: "Show economy leaderboard", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+cast({ pattern: "econboard", desc: "Show economy leaderboard", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
   try {
       const db = await connectDB();
-      const rows = await db.collection("weirdo_rpg").find({}).toArray();
-      if (!rows || rows.length === 0) return reply("No economy data yet.");
+      // Filter: must have a username AND be registered AND not a child NPC
+      const rows = await db.collection("weirdo_rpg").find({
+          username: { $exists: true, $ne: null, $ne: "" },
+          isChildNpc: { $ne: true },
+          $or: [{ registered: true }, { level: { $gt: 1 } }, { money: { $gt: 0 } }]
+      }).toArray();
 
-      const scored = rows.map(r => {
-        let nw = (r.money || 0) + (r.bank || 0);
-        return { id: r._id, user: r.username || r._id, score: nw };
-      }).sort((a,b) => b.score - a.score).slice(0, 10);
+      if (!rows || rows.length === 0) return reply("No registered players yet. Players join with *joinrpg*.");
 
-      let out = "🏆 *GLOBAL ECONOMY BOARD*\n_(Ranked by Wallet + Bank)_\n\n";
-      const mentions = [];
+      const scored = rows
+        .map(r => ({ id: r._id, user: r.username, score: (r.money||0)+(r.bank||0) }))
+        .filter(r => r.user && r.user !== r.id) // must have real username
+        .sort((a,b) => b.score - a.score)
+        .slice(0, 10);
+
+      if (!scored.length) return reply("No ranked players yet.");
+
+      const medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
+      let out = "🏆 *GLOBAL ECONOMY BOARD*\n_(Wallet + Bank)_\n\n";
+      const ecMentions = [];
 
       for (let i=0; i<scored.length; i++) {
-        mentions.push(toJid(scored[i].id));
-        out += `${i+1}. @${scored[i].id} — ${fmtMoney(scored[i].score)}\n`;
+        ecMentions.push(toJid(scored[i].id));
+        out += `${medals[i]} *${scored[i].user}* — ${fmtMoney(scored[i].score)}\n`;
       }
-      return conn.sendMessage(m.chat, { text: out, mentions }, { quoted: mek });
+      return conn.sendMessage(m.chat, { text: out, mentions: ecMentions }, { quoted: mek });
   } catch(e) { console.error(e); }
 });
 
@@ -1103,57 +1664,102 @@ async function handleStashCmd(conn, mek, m, { reply }) {
       return reply(`🎒 *Your Stash:*\n\n${invText}`);
   } catch(e) { console.error(e); }
 }
-cmd({ pattern: 'stash',   desc: 'View your inventory',          category: 'rpg', filename: __filename }, handleStashCmd);
-cmd({ pattern: 'econinv', desc: 'View inventory (alias: stash)', category: 'rpg', filename: __filename }, handleStashCmd);
+cast({ pattern: 'stash',   desc: 'View your inventory',          category: 'rpg', filename: __filename }, handleStashCmd);
+cast({ pattern: 'econinv', desc: 'View inventory (alias: stash)', category: 'rpg', filename: __filename }, handleStashCmd);
 
 // BAILOUT
-cmd({ pattern: "bailout", desc: "Bribe cops to reduce prison time", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "bailout", desc: "Bribe cops to reduce prison time", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
 
-      if (!acc.jailedUntil || acc.jailedUntil <= now() || acc.health <= 0) return reply("You are not currently in prison.");
+      if (!acc.jailedUntil || acc.jailedUntil <= now()) return reply("You're not in jail.");
+      // Distinguish jail vs hospital
+      if (!acc.inJail) return reply(`🏥 You're in *hospital*, not jail. Use *paymeds* or *callnurse @friend* instead.`);
+
+      const remaining   = acc.jailedUntil - now();
+      // Flat $500 per minute — affordable for everyone regardless of level
+      const costPerMin  = iC(500);
+      const maxReduceMs = Math.floor(remaining * 0.60);
+      const maxReduceMin = Math.ceil(maxReduceMs / 60000);
+      const maxCost     = costPerMin * maxReduceMin;
 
       const amount = parseInt(args[0]||"0");
-      if (isNaN(amount) || amount <= 0) return reply(`⛓️ In prison for ${msToTime(acc.jailedUntil - now())}.\n\n*Bribe Cops:* bailout <amount>\n_( ${fmtMoney(iC(500))} removes 1 minute )_`);
+      if (isNaN(amount) || amount <= 0) return reply([
+          `⛓️ *IN JAIL* — ${msToTime(remaining)}`,
+          ``,
+          `*Bribe Cops:* bailout <amount>`,
+          `   Rate: *${fmtMoney(costPerMin)}/minute*`,
+          `   Max reduction: 60% of sentence`,
+          `   Full 60% bail: *${fmtMoney(maxCost)}*`,
+          ``,
+          `Tip: *jailwork* (free, -20min×3), *lawyercall* (50% off), *callawyer @friend* (law degree helps), *helpbailout @friend* (they pay for you)`
+      ].join('\n'));
 
-      if (acc.money < amount) return reply("Not enough balance to pay the bribe.");
+      if (acc.money < amount) return reply(`Not enough cash. You have ${fmtMoney(acc.money)}.`);
 
-      const reduceMs = Math.floor(amount / iC(500)) * 60 * 1000;
-      acc.money -= amount;
-      acc.jailedUntil = Math.max(now(), acc.jailedUntil - reduceMs);
+      const minsReduced  = Math.floor(amount / costPerMin);
+      const actualReduce = Math.min(minsReduced * 60 * 1000, maxReduceMs);
+      if (actualReduce <= 0) return reply(`Minimum bribe is ${fmtMoney(costPerMin)} (removes 1 minute).`);
 
+      const actualCost = Math.ceil(actualReduce / 60000) * costPerMin;
+      acc.money -= actualCost;
+      acc.jailedUntil = Math.max(now(), acc.jailedUntil - actualReduce);
+      if (acc.jailedUntil <= now()) acc.inJail = false;
+      logFinancial(acc, `⛓️ Bail paid (${Math.ceil(actualReduce/60000)} min)`, -actualCost);
       await saveAccount(acc);
       if (acc.jailedUntil <= now()) {
-          return reply(`🚔 You paid a ${fmtMoney(amount)} bribe and were released immediately!`);
+          return reply(`🚔 Paid *${fmtMoney(actualCost)}*. Cops released you — free!`);
       } else {
-          return reply(`🚔 You paid ${fmtMoney(amount)}. Remaining sentence: ${msToTime(acc.jailedUntil - now())}`);
+          return reply(`🚔 Paid *${fmtMoney(actualCost)}*. Remaining: *${msToTime(acc.jailedUntil - now())}*`);
       }
   } catch(e) { console.error(e); }
 });
 
 // PAY MEDS
-cmd({ pattern: "paymeds", desc: "Pay private docs to heal instantly", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "paymeds", desc: "Pay private docs to heal instantly", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
 
-      if (acc.health > 0 && (!acc.jailedUntil || acc.jailedUntil <= now())) return reply("You don't need emergency medical care.");
-      if (acc.health > 0 && acc.jailedUntil > now()) return reply("You are in PRISON, not the hospital. Use 'bailout'.");
+      if (!acc.jailedUntil || acc.jailedUntil <= now()) return reply("You're not in hospital.");
+      if (acc.inJail) return reply(`⛓️ You're in *jail*, not hospital. Use *bailout* or *callawyer @friend* instead.`);
+
+      const remaining = acc.jailedUntil - now();
+      const lvl = acc.level || 1;
+      // Hospital: $10k × level per minute (reasonable)
+      const medCostPerMin = iC(10000) * lvl;
+      const maxMedReduce  = Math.floor(remaining * 0.60);
+      const maxMedMin     = Math.ceil(maxMedReduce / 60000);
+      const maxMedCost    = medCostPerMin * maxMedMin;
 
       const amount = parseInt(args[0]||"0");
-      if (isNaN(amount) || amount <= 0) return reply(`🏥 Hospitalized for ${msToTime(acc.jailedUntil - now())}.\n\n*Pay Private Doctors:* paymeds <amount>\n_( ${fmtMoney(iC(1000))} removes 1 minute )_`);
+      if (isNaN(amount) || amount <= 0) return reply([
+          `🏥 *IN HOSPITAL* — ${msToTime(remaining)}`,
+          ``,
+          `*Private Medical Discharge:* paymeds <amount>`,
+          `   Rate: *${fmtMoney(medCostPerMin)}/minute* (Level ${lvl})`,
+          `   Max reduction: 60% of sentence`,
+          `   Full 60% discharge: *${fmtMoney(maxMedCost)}*`,
+          ``,
+          `_Cheaper alternatives: use medkits to restore HP, or wait it out._`
+      ].join('\n'));
 
-      if (acc.money < amount) return reply("Not enough balance to pay medical bills.");
+      if (acc.money < amount) return reply(`Not enough cash. You have ${fmtMoney(acc.money)}.`);
 
-      const reduceMs = Math.floor(amount / iC(1000)) * 60 * 1000;
-      acc.money -= amount;
-      acc.jailedUntil = Math.max(now(), acc.jailedUntil - reduceMs);
+      const medMinsReduced = Math.floor(amount / medCostPerMin);
+      const actualMedReduce = Math.min(medMinsReduced * 60 * 1000, maxMedReduce);
+      if (actualMedReduce <= 0) return reply(`Minimum payment is ${fmtMoney(medCostPerMin)} (removes 1 minute).`);
+
+      const actualMedCost = Math.ceil(actualMedReduce / 60000) * medCostPerMin;
+      acc.money -= actualMedCost;
+      acc.jailedUntil = Math.max(now(), acc.jailedUntil - actualMedReduce);
 
       if (acc.jailedUntil <= now()) {
-          acc.health = acc.maxHealth;
+          acc.health = Math.min(acc.maxHealth || 100, (acc.health || 1) + 30);
+          acc.inJail = false;
           await saveAccount(acc);
-          return reply(`🏥 You paid ${fmtMoney(amount)} for experimental surgery. You are fully healed and discharged!`);
+          return reply(`🏥 Paid *${fmtMoney(actualMedCost)}*. You've been discharged. Partially healed (+30 HP).`);
       } else {
           await saveAccount(acc);
           return reply(`🏥 You paid ${fmtMoney(amount)}. Remaining recovery time: ${msToTime(acc.jailedUntil - now())}`);
@@ -1169,9 +1775,10 @@ cmd({ pattern: "paymeds", desc: "Pay private docs to heal instantly", category: 
 //   • After 3 min (or when 5 members join) the creator runs  gangrob go  to execute
 //   • Combined attacker power is pooled — easy to overpower even strong targets
 //   • Loot split equally after VAT; each participant heat +10
-const gangRobSessions = new Map(); // targetId → { attackers: [id,...], openUntil, from }
+// global.gangRobSessions is shared with torn.js tick via global — DO NOT redeclare
+if (!global.gangRobSessions) global.gangRobSessions = new Map();
 
-cmd({ pattern: "gangrob", desc: "gangrob @target | gangrob go — Organised mugging", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "gangrob", desc: "gangrob @target | gangrob go — Organised mugging", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const senderId  = await getPlayerId(conn, m.sender);
       const senderAcc = await getAccount(senderId);
@@ -1187,23 +1794,23 @@ cmd({ pattern: "gangrob", desc: "gangrob @target | gangrob go — Organised mugg
       if (subCmd === 'go') {
           // Find session where this sender is the organiser (first in list)
           let session = null, sessionTargetId = null;
-          for (const [tid, s] of gangRobSessions.entries()) {
+          for (const [tid, s] of global.gangRobSessions.entries()) {
               if (s.attackers[0] === senderId) { session = s; sessionTargetId = tid; break; }
           }
           if (!session) return reply(`❌ You don't have an open gang rob session.\nStart one with: gangrob @target`);
           if (session.openUntil < now()) {
-              gangRobSessions.delete(sessionTargetId);
+              global.gangRobSessions.delete(sessionTargetId);
               return reply(`⏰ Your gang rob session expired. Start a new one.`);
           }
           if (session.attackers.length < 2) return reply(`👥 Need at least 2 attackers. Wait for more to join.`);
 
           const victim = await getAccount(sessionTargetId);
           if (!victim.money || victim.money <= 100) {
-              gangRobSessions.delete(sessionTargetId);
+              global.gangRobSessions.delete(sessionTargetId);
               return reply(`😂 Target is broke. Victim has nothing worth taking.`);
           }
           if (victim.robImmunityUntil && victim.robImmunityUntil > now()) {
-              gangRobSessions.delete(sessionTargetId);
+              global.gangRobSessions.delete(sessionTargetId);
               return reply(`🛡️ *${victim.username || sessionTargetId}* just activated rob protection! Session cancelled.`);
           }
 
@@ -1232,7 +1839,7 @@ cmd({ pattern: "gangrob", desc: "gangrob @target | gangrob go — Organised mugg
               a.lastRob    = now();
           }
 
-          gangRobSessions.delete(sessionTargetId);
+          global.gangRobSessions.delete(sessionTargetId);
           const mentions = session.attackers.map(toJid).concat([toJid(sessionTargetId)]);
 
           if (Math.random() < chance) {
@@ -1275,9 +1882,50 @@ cmd({ pattern: "gangrob", desc: "gangrob @target | gangrob go — Organised mugg
           }
       }
 
+      // ── INVITE CHILD: gangrob invitechild <childname> ────────────────────
+      if (subCmd === 'invitechild') {
+          const childName = (args[1] || '').toLowerCase();
+          if (!childName) return reply(`Usage: *gangrob invitechild <childname>*\nInvites your activated child to join your active gang rob.`);
+
+          // Find active session this player organised
+          let mySession = null, myTargetId = null;
+          for (const [tid, s] of global.gangRobSessions.entries()) {
+              if (s.attackers[0] === senderId) { mySession = s; myTargetId = tid; break; }
+          }
+          if (!mySession) return reply(`❌ You don't have an open gang rob. Start one with: *gangrob @target*`);
+          if (mySession.openUntil < now()) {
+              global.gangRobSessions.delete(myTargetId);
+              return reply(`⏰ Your session expired.`);
+          }
+          if (mySession.attackers.length >= 5) return reply(`👥 Crew is full (5/5).`);
+
+          // Look up activated children of this player from torn.js Player model
+          const mongoose = require('mongoose');
+          const Player2  = mongoose.models.RPGPlayer;
+          if (!Player2) return reply(`❌ Can't look up children right now.`);
+
+          const parent = await Player2.findById(senderId).exec().catch(()=>null);
+          if (!parent) return reply(`❌ Could not find your player record.`);
+
+          const childRecord = (parent.children||[]).find(c =>
+              c.activated && (c.childPid || c.playerId) &&
+              (c.name||'').toLowerCase().includes(childName)
+          );
+          if (!childRecord) return reply(`❌ No activated child named "${args[1]}" found.\nUse *mychildren* to see your activated children and their names.`);
+
+          const childId = childRecord.childPid || childRecord.playerId;
+          if (mySession.attackers.includes(childId)) return reply(`✅ ${childRecord.name} is already in the crew.`);
+
+          mySession.attackers.push(childId);
+          return conn.sendMessage(from, {
+              text: [`🤜 *${childRecord.name}* (your child) joined the gang rob!`, `👥 Crew: ${mySession.attackers.length}/5`, ``, `Run *gangrob go* when ready.`].join('\n'),
+              mentions: [toJid(senderId)]
+          }, { quoted: mek });
+      }
+
       // ── JOIN: if there's an active session for this target, join it ───────
       const targetId = await getTargetId(conn, mek, args, 0);
-      if (!targetId) return reply(`Usage:\n• *gangrob @target* — start or join a gang rob\n• *gangrob go* — execute when ready (organiser only)`);
+      if (!targetId) return reply(`Usage:\n• *gangrob @target* — start or join a gang rob\n• *gangrob invitechild <name>* — add your activated child\n• *gangrob go* — execute when ready (organiser only)`);
       if (targetId === senderId) return reply("You can't rob yourself.");
 
       const myCity     = normLoc(senderAcc.location);
@@ -1288,10 +1936,10 @@ cmd({ pattern: "gangrob", desc: "gangrob @target | gangrob go — Organised mugg
       }
 
       // Check if there's an existing session for this target
-      if (gangRobSessions.has(targetId)) {
-          const s = gangRobSessions.get(targetId);
+      if (global.gangRobSessions.has(targetId)) {
+          const s = global.gangRobSessions.get(targetId);
           if (s.openUntil < now()) {
-              gangRobSessions.delete(targetId); // expired, start fresh below
+              global.gangRobSessions.delete(targetId); // expired, start fresh below
           } else if (s.attackers.includes(senderId)) {
               return reply(`✅ You're already in this gang rob. Organiser runs *gangrob go* to execute.\n👥 Current crew: ${s.attackers.length}/5`);
           } else if (s.attackers.length >= 5) {
@@ -1311,14 +1959,64 @@ cmd({ pattern: "gangrob", desc: "gangrob @target | gangrob go — Organised mugg
           return reply(`⏳ Rob cooldown: ${msToTime(COOLDOWN - (now() - (senderAcc.lastRob||0)))} left.`);
       if (!victim2.money || victim2.money <= 100) return reply("Target is broke — nothing to steal.");
 
-      gangRobSessions.set(targetId, {
+      global.gangRobSessions.set(targetId, {
           attackers: [senderId],
           openUntil: now() + 3 * 60 * 1000,
           from
       });
 
       // Auto-expire after 3 minutes
-      setTimeout(() => { gangRobSessions.delete(targetId); }, 3 * 60 * 1000);
+      setTimeout(async () => {
+          const sess = global.gangRobSessions.get(targetId);
+          if (!sess) return; // already executed
+          global.gangRobSessions.delete(targetId);
+          // Auto-execute if at least 2 attackers joined (organiser might be a child NPC)
+          if (sess.attackers.length < 2) return;
+          try {
+              const victim = await getAccount(targetId);
+              if (!victim || (victim.money||0) <= 100) return;
+              let totalAtkPower = 0;
+              const attackerAccounts = [];
+              for (const aid of sess.attackers) {
+                  const a = await getAccount(aid).catch(()=>null);
+                  if (!a) continue;
+                  const g = getEconGearBonus(a);
+                  totalAtkPower += (a.strength||3)+(a.speed||3)+g.atkBonus+g.strBonus+g.spdBonus;
+                  attackerAccounts.push(a);
+              }
+              if (!attackerAccounts.length) return;
+              const vicGear = getEconGearBonus(victim);
+              const defPow  = (victim.strength||3)+(victim.defense||3)+vicGear.defBonus+vicGear.strBonus;
+              const chance  = Math.min(0.92, 0.40 + 0.25 * (totalAtkPower / Math.max(1, defPow) - 1));
+              for (const a of attackerAccounts) { a.crimeLevel = Math.min(100,(a.crimeLevel||0)+10); a.lastRob = now(); }
+              if (Math.random() < chance) {
+                  const pct       = 0.15 + Math.random()*0.20;
+                  const totalGross = Math.floor((victim.money||0) * pct);
+                  const { net: totalNet, vat } = applyVAT(totalGross);
+                  const perPerson = Math.floor(totalNet / attackerAccounts.length);
+                  victim.money -= totalGross;
+                  logFinancial(victim, `Gang-robbed (auto) by ${attackerAccounts.length} attackers`, -totalGross);
+                  await saveAccount(victim);
+                  for (const a of attackerAccounts) {
+                      a.money = capBalance((a.money||0) + perPerson);
+                      a.crimesCommitted = (a.crimesCommitted||0)+1;
+                      addTaxableIncome(a, perPerson);
+                      logFinancial(a, `Gang rob (auto) cut`, perPerson);
+                      await saveAccount(a);
+                  }
+                  const names = attackerAccounts.map(a=>a.username||a._id).join(', ');
+                  const msg = `🦹 *AUTO GANG ROB EXECUTED!*\n${names} robbed *${victim.username||targetId}*!\nStole *${fmtMoney(totalGross)}* → *${fmtMoney(perPerson)}* each`;
+                  if (global.wwGameChat && global.wwConn) {
+                      global.wwConn.sendMessage(global.wwGameChat, { text: msg }).catch(()=>{});
+                  }
+              } else {
+                  for (const a of attackerAccounts) {
+                      if (Math.random() < 0.4) { a.jailedUntil = now()+10*60*1000; a.inJail = true; }
+                      await saveAccount(a);
+                  }
+              }
+          } catch(autoErr) { console.error('gangrob auto-execute error:', autoErr); }
+      }, 3 * 60 * 1000);
 
       return conn.sendMessage(from, {
           text: `🦹 *Gang Rob Initiated!*\n\nTarget: @${targetId} (in *${victim2.location || 'Weirdos World'}*)\n👥 Crew: 1/5\n⏳ Window: 3 minutes\n\n*Others in ${senderAcc.location || 'Weirdos World'} can join with:*\ngangrob @${targetId}\n\nOrganiser runs *gangrob go* when ready.`,
@@ -1340,9 +2038,9 @@ cmd({ pattern: "gangrob", desc: "gangrob @target | gangrob go — Organised mugg
 //   • On 'gangattack go': combined attacker power vs combined defender power
 //   • Winner takes 15–30% of target's wallet. Losers get fined/jailed.
 // =============================================================================
-const gangAttackSessions = new Map(); // targetId → { attackers:[id,...], defenders:[id,...], openUntil, from }
+if (!global.gangAttackSessions) global.gangAttackSessions = new Map();
 
-cmd({ pattern: "gangattack", desc: "gangattack @target | gangattack go — Organised gang attack", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "gangattack", desc: "gangattack @target | gangattack go — Organised gang attack", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const senderId  = await getPlayerId(conn, m.sender);
       const senderAcc = await getAccount(senderId);
@@ -1357,15 +2055,15 @@ cmd({ pattern: "gangattack", desc: "gangattack @target | gangattack go — Organ
       // ── EXECUTE ───────────────────────────────────────────────────────────
       if (subCmd === 'go') {
           let session = null, sessionTargetId = null;
-          for (const [tid, s] of gangAttackSessions.entries()) {
+          for (const [tid, s] of global.gangAttackSessions.entries()) {
               if (s.attackers[0] === senderId) { session = s; sessionTargetId = tid; break; }
           }
           if (!session) return reply(`❌ You don't have an open gang attack. Start one: gangattack @target`);
-          if (session.openUntil < now()) { gangAttackSessions.delete(sessionTargetId); return reply(`⏰ Session expired.`); }
+          if (session.openUntil < now()) { global.gangAttackSessions.delete(sessionTargetId); return reply(`⏰ Session expired.`); }
           if (session.attackers.length < 2) return reply(`👥 Need at least 2 attackers. Wait for others to join.`);
 
           const victim = await getAccount(sessionTargetId);
-          if (!victim.money || victim.money <= 100) { gangAttackSessions.delete(sessionTargetId); return reply(`😂 Target is broke. Nothing worth taking.`); }
+          if (!victim.money || victim.money <= 100) { global.gangAttackSessions.delete(sessionTargetId); return reply(`😂 Target is broke. Nothing worth taking.`); }
 
           // Load all accounts
           const attackerAccs = await Promise.all(session.attackers.map(id => getAccount(id)));
@@ -1389,7 +2087,7 @@ cmd({ pattern: "gangattack", desc: "gangattack @target | gangattack go — Organ
           const defRoll  = defPower * (0.85 + Math.random() * 0.30);
           const atkWon   = atkRoll > defRoll;
 
-          gangAttackSessions.delete(sessionTargetId);
+          global.gangAttackSessions.delete(sessionTargetId);
           const mentions = [...session.attackers, ...session.defenders, sessionTargetId].map(toJid);
 
           const powerBar = (pow, total) => { const n = Math.min(10, Math.round((pow/Math.max(1,total))*10)); return '█'.repeat(n)+'░'.repeat(10-n); };
@@ -1452,9 +2150,9 @@ cmd({ pattern: "gangattack", desc: "gangattack @target | gangattack go — Organ
       if (!victim.money || victim.money <= 100) return reply(`Target is broke. Nothing worth taking.`);
 
       // Check if target is already being defended — can still attack them
-      if (gangAttackSessions.has(targetId)) {
-          const s = gangAttackSessions.get(targetId);
-          if (s.openUntil < now()) { gangAttackSessions.delete(targetId); }
+      if (global.gangAttackSessions.has(targetId)) {
+          const s = global.gangAttackSessions.get(targetId);
+          if (s.openUntil < now()) { global.gangAttackSessions.delete(targetId); }
           else if (s.attackers.includes(senderId)) return reply(`✅ You're already in this attack. Organiser runs *gangattack go*.`);
           else if (s.attackers.length >= 5) return reply(`👥 Attack crew is full (5/5).`);
           else {
@@ -1467,8 +2165,8 @@ cmd({ pattern: "gangattack", desc: "gangattack @target | gangattack go — Organ
       const COOLDOWN = 20 * 60 * 1000;
       if (now() - (senderAcc.lastRob || 0) < COOLDOWN) return reply(`⏳ Rob cooldown: ${msToTime(COOLDOWN - (now()-(senderAcc.lastRob||0)))} left.`);
 
-      gangAttackSessions.set(targetId, { attackers: [senderId], defenders: [], openUntil: now() + 3*60*1000, from });
-      setTimeout(() => { gangAttackSessions.delete(targetId); }, 3*60*1000);
+      global.gangAttackSessions.set(targetId, { attackers: [senderId], defenders: [], openUntil: now() + 3*60*1000, from });
+      setTimeout(() => { global.gangAttackSessions.delete(targetId); }, 3*60*1000);
 
       return conn.sendMessage(from, {
           text: [`⚔️ *GANG ATTACK OPENED!*`, ``, `Target: @${targetId} (${vicCity})`, `👥 Attackers: 1/5 | 🛡️ Defenders: 0`, `⏳ 3-minute window`, ``, `*Join the attack:* gangattack @${targetId}`, `*Defend ${victim.username||targetId}:* defend @${targetId}`, ``, `Organiser runs *gangattack go* when ready.`].join('\n'),
@@ -1478,7 +2176,7 @@ cmd({ pattern: "gangattack", desc: "gangattack @target | gangattack go — Organ
   } catch(e) { console.error('gangattack error', e); }
 });
 
-cmd({ pattern: "defend", desc: "defend @player — join someone's defence against a gang attack", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "defend", desc: "defend @player — join someone's defence against a gang attack", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const senderId  = await getPlayerId(conn, m.sender);
       const senderAcc = await getAccount(senderId);
@@ -1492,9 +2190,9 @@ cmd({ pattern: "defend", desc: "defend @player — join someone's defence agains
       if (!targetId) return reply(`Usage: defend @player\n\nJoins the defence of a player being gang attacked.`);
       if (targetId === senderId) return reply(`You're already defending yourself by being the target.`);
 
-      if (!gangAttackSessions.has(targetId)) return reply(`@${targetId} is not currently under a gang attack. Nothing to defend.`);
-      const s = gangAttackSessions.get(targetId);
-      if (s.openUntil < now()) { gangAttackSessions.delete(targetId); return reply(`The attack window expired.`); }
+      if (!global.gangAttackSessions.has(targetId)) return reply(`@${targetId} is not currently under a gang attack. Nothing to defend.`);
+      const s = global.gangAttackSessions.get(targetId);
+      if (s.openUntil < now()) { global.gangAttackSessions.delete(targetId); return reply(`The attack window expired.`); }
 
       const myCity  = normLoc(senderAcc.location);
       const victim  = await getAccount(targetId);
@@ -1512,7 +2210,7 @@ cmd({ pattern: "defend", desc: "defend @player — join someone's defence agains
   } catch(e) { console.error('defend error', e); }
 });
 
-cmd({ pattern: "toggledrains", desc: "[Creator] Toggle hourly economy drains on/off", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+cast({ pattern: "toggledrains", desc: "[Creator] Toggle hourly economy drains on/off", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
   try {
       const senderId   = await getPlayerId(conn, m.sender);
       const CREATOR_ID = '2348084644182';
@@ -1532,39 +2230,57 @@ cmd({ pattern: "toggledrains", desc: "[Creator] Toggle hourly economy drains on/
 });
 
 // ECON DRAINS INFO — Anyone can check drain status
-cmd({ pattern: "econdrains", desc: "Check if economy drains are active", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+cast({ pattern: "econdrains", desc: "Check all active drains and toggle status", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
   try {
       const senderId = await getPlayerId(conn, m.sender);
       const acc      = await getAccount(senderId);
       const total    = (acc.money || 0) + (acc.bank || 0);
-      const wRate    = getWealthTaxRate(total);
 
+      // Toggle status
+      const drainsOn  = global.weirdo_drains_enabled !== false;
+      const wealthOn  = global.wealth_drain_enabled  !== false;
+      const taxOn     = global.weirdo_tax_enabled    !== false;
+
+      // Calculate each drain (inflation-adjusted)
       let propTax = 0;
       for (const [pId, qty] of Object.entries(acc.properties || {})) {
-          propTax += Math.ceil((DEFAULT_PROP_PRICES[pId] || 0) * PROPERTY_TAX_RATE * (qty || 0));
+          propTax += Math.ceil(iC(DEFAULT_PROP_PRICES[pId] || 0) * PROPERTY_TAX_RATE * (qty || 0));
       }
       let gearCost = 0;
+      const gearBreakdown = [];
       for (const slot of ['equippedWeapon','equippedArmor','equippedHelmet','equippedGloves','equippedKneePads','equippedBoots']) {
-          if (acc[slot]) gearCost += iC(GEAR_MAINTENANCE_BASE[getItemRarity(acc[slot])] || 200);
+          if (!acc[slot]) continue;
+          const c = iC(GEAR_MAINTENANCE_BASE[getItemRarity(acc[slot])] || 200);
+          gearCost += c;
+          gearBreakdown.push(`${acc[slot]}: ${fmtMoney(c)}/hr`);
       }
-      const wealthTax   = Math.ceil(total * wRate);
-      const factionDues = acc.faction ? iC(FACTION_DUES_BASE) : 0;
-      const totalDrain  = propTax + gearCost + wealthTax + factionDues;
+      const wRate     = getWealthTaxRate(total);
+      const wealthTax = wealthOn ? Math.ceil(total * wRate) : 0;
+      const facDues   = acc.faction ? iC(FACTION_DUES_BASE) : 0;
+      const loanInt   = acc.activeLoan?.owed > 0
+          ? Math.ceil(acc.activeLoan.owed * (acc.activeLoan.ratePerHour || 0.010))
+          : 0;
 
-      return reply([
-          `📊 *Economy Drains: ${global.weirdo_drains_enabled ? '✅ ON' : '❌ OFF (suspended)'}*`,
+      const totalDrain = (drainsOn ? propTax + gearCost + facDues : 0) + wealthTax + loanInt;
+
+      const lines = [
+          `📊 *YOUR DRAIN STATUS*`, ``,
+          `⚙️ Main drains (toggledrains):   ${drainsOn  ? '✅ ON' : '❌ OFF'}`,
+          `💸 Wealth drain (togglewealthdrain): ${wealthOn ? '✅ ON' : '❌ OFF'}`,
+          `🏛️ Tax / VAT (toggletax):        ${taxOn     ? '✅ ON' : '❌ OFF'}`,
           ``,
-          `Your hourly costs:`,
-          `🏠 Property tax:   ${fmtMoney(propTax)}/hr`,
-          `🔧 Gear maint:     ${fmtMoney(gearCost)}/hr`,
-          `💸 Wealth tax (${(wRate*100).toFixed(1)}%): ${fmtMoney(wealthTax)}/hr`,
-          `🏢 Faction dues:   ${fmtMoney(factionDues)}/hr`,
+          `*Your costs (per hour):*`,
+          drainsOn ? `🏠 Property tax:    ${fmtMoney(propTax)}/hr` : `🏠 Property tax:    SUSPENDED`,
+          drainsOn ? `🔧 Gear maint:      ${fmtMoney(gearCost)}/hr${gearBreakdown.length ? `\n   (${gearBreakdown.join(', ')})` : ''}` : `🔧 Gear maint:      SUSPENDED`,
+          `💸 Wealth tax (${(wRate*100).toFixed(1)}%): ${wealthOn ? fmtMoney(wealthTax)+'/hr' : 'SUSPENDED'}`,
+          acc.faction ? (drainsOn ? `🏢 Faction dues:    ${fmtMoney(facDues)}/hr` : `🏢 Faction dues:    SUSPENDED`) : `🏢 Faction dues:    N/A (no faction)`,
+          loanInt > 0 ? `🦈 Loan interest:   ${fmtMoney(loanInt)}/hr on ${fmtMoney(acc.activeLoan.owed)} owed` : null,
           ``,
-          `💀 Total drain: *${fmtMoney(totalDrain)}/hr*`,
-          acc.gearInsurance
-              ? `🛡️ Gear Insurance: Active`
-              : `❌ No gear insurance — gear can be lost on death`
-      ].join('\n'));
+          `💀 *Active total drain: ${fmtMoney(totalDrain)}/hr*`,
+          acc.gearInsurance ? `🛡️ Gear Insurance: Active` : `❌ No gear insurance`
+      ].filter(l => l !== null);
+
+      return reply(lines.join('\n'));
   } catch(e) { console.error('econdrains error', e); }
 });
 
@@ -1575,10 +2291,11 @@ cmd({ pattern: "econdrains", desc: "Check if economy drains are active", categor
 if (!global.lottoJackpot) global.lottoJackpot = iC(50000);
 if (!global.lottoTickets) global.lottoTickets = {}; // { playerId: ticketCount }
 
-cmd({ pattern: "lotto", desc: "lotto buy [qty] | lotto draw | lotto status", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "lotto", desc: "lotto buy [qty] | lotto draw | lotto status", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id      = await getPlayerId(conn, m.sender);
       const acc     = await getAccount(id);
+      if (isHospitalized(acc)) return reply(`⛓️ Action blocked — you're in ${acc.inJail ? 'jail' : 'hospital'}. Serve your time first.`);
       const sub     = (args[0] || 'status').toLowerCase();
       const CREATOR = '2348084644182';
       const TICKET_PRICE = iC(1000);
@@ -1666,7 +2383,7 @@ cmd({ pattern: "lotto", desc: "lotto buy [qty] | lotto draw | lotto status", cat
 // SMUGGLE — Run contraband from your current location back to Weirdos World
 // Can only be done when NOT already at Weirdos World. High risk, high reward.
 // =============================================================================
-cmd({ pattern: "smuggle", desc: "Run contraband for a big payout (not in Weirdos World)", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+cast({ pattern: "smuggle", desc: "Run contraband for a big payout (not in Weirdos World)", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -1692,8 +2409,8 @@ cmd({ pattern: "smuggle", desc: "Run contraband for a big payout (not in Weirdos
       // Reward scales with how far the city is
       const cityTiers = { mexico: 1, london: 2, japan: 3, switzerland: 4 };
       const tier = cityTiers[city] || 1;
-      const baseReward = iC(20000) * tier;
-      const failChance = 0.35 + (tier * 0.03); // harder cities = slightly riskier too
+      const baseReward = iC(2500) * tier;
+      const failChance = 0.45 + (tier * 0.05); // harder cities = riskier
 
       acc.cooldowns = acc.cooldowns || {};
       acc.cooldowns.smuggle = now();
@@ -1702,7 +2419,7 @@ cmd({ pattern: "smuggle", desc: "Run contraband for a big payout (not in Weirdos
       if (Math.random() > failChance) {
           const reward = Math.floor(baseReward + Math.random() * baseReward);
           const { net, vat } = applyVAT(reward);
-          acc.money += net;
+          acc.money = capBalance((acc.money||0) + net);
           addTaxableIncome(acc, net);
           logFinancial(acc, `Smuggling run from ${acc.location}`, net);
           await saveAccount(acc);
@@ -1740,7 +2457,7 @@ cmd({ pattern: "smuggle", desc: "Run contraband for a big payout (not in Weirdos
 // =============================================================================
 // HITMAN — Pay to have an NPC crew jail your target for a while
 // =============================================================================
-cmd({ pattern: "hitman", desc: "hitman @player — pay to have someone jailed", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "hitman", desc: "hitman @player — pay to have someone jailed", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id       = await getPlayerId(conn, m.sender);
       const targetId = await getTargetId(conn, mek, args, 0);
@@ -1815,29 +2532,32 @@ cmd({ pattern: "hitman", desc: "hitman @player — pay to have someone jailed", 
 // After 30 min unpaid the shark starts taking from your wallet automatically.
 // loan take <amount> | loan pay <amount> | loan status
 // =============================================================================
-cmd({ pattern: "loan", desc: "loan take <amount> | loan pay <amount> | loan status", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "loan", desc: "loan take <amount> | loan pay <amount> | loan status", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
       const sub = (args[0] || 'status').toLowerCase();
-      const MAX_LOAN           = iC(500000);
-      const RATE_PER_5MIN      = 0.02;   // 2% compound every 5 minutes = ~24% per hour
-      const COMPOUND_INTERVAL  = 5 * 60 * 1000;
+      // Credit score: simple inline calc (mirrors torn.js getCreditScore)
+      const _total  = (acc.money||0) + (acc.bank||0);
+      const _heat   = acc.crimeLevel || 0;
+      const _lvl    = acc.level || 1;
+      const _deaths = acc.deathCount || 0;
+      let _score    = 580;
+      if (_total >= 10_000_000) _score += 80;
+      else if (_total >= 1_000_000) _score += 50;
+      else if (_total >= 100_000) _score += 20;
+      else if (_total < 1000) _score -= 50;
+      if (_heat >= 75) _score -= 100; else if (_heat >= 50) _score -= 60; else if (_heat >= 25) _score -= 30; else if (_heat === 0) _score += 30;
+      if ((acc.taxOwed||0) > 1_000_000) _score -= 80; else if ((acc.taxOwed||0) > 100_000) _score -= 40; else if ((acc.taxPaid||0) > 500_000) _score += 40;
+      if (_lvl >= 50) _score += 50; else if (_lvl >= 20) _score += 25; else if (_lvl < 5) _score -= 20;
+      if (_deaths >= 3) _score -= 60; else if (_deaths >= 1) _score -= 20;
+      _score = Math.min(850, Math.max(300, _score));
+      const MAX_LOAN      = _score >= 750 ? iC(2_000_000) : _score >= 680 ? iC(1_000_000) : _score >= 580 ? iC(500_000) : _score >= 480 ? iC(200_000) : iC(50_000);
+      const RATE_PER_HOUR_ADJ = _score >= 750 ? 0.005 : _score >= 680 ? 0.008 : _score >= 580 ? 0.010 : _score >= 480 ? 0.012 : 0.015;
+      const RATE_DISPLAY  = `${(RATE_PER_HOUR_ADJ*100).toFixed(1)}%/hr`;
 
-      // ── Apply compound interest on every getAccount call ─────────────────
-      // (also done in getAccount loop, but we recalc here for display accuracy)
-      function applyCompound(loan) {
-          if (!loan || loan.owed <= 0) return loan;
-          const intervals = Math.floor((Date.now() - (loan.lastCompound || loan.takenAt)) / COMPOUND_INTERVAL);
-          if (intervals <= 0) return loan;
-          let owed = loan.owed;
-          for (let i = 0; i < intervals; i++) owed = Math.ceil(owed * (1 + RATE_PER_5MIN));
-          loan.owed = owed;
-          loan.lastCompound = (loan.lastCompound || loan.takenAt) + intervals * COMPOUND_INTERVAL;
-          return loan;
-      }
-
-      const loan = acc.activeLoan ? applyCompound({ ...acc.activeLoan }) : null;
+      // Loan is already compounded by getAccount — just read it directly
+      const loan = acc.activeLoan && acc.activeLoan.owed > 0 ? acc.activeLoan : null;
 
       if (sub === 'status') {
           if (!loan || loan.owed <= 0) return reply([
@@ -1845,29 +2565,33 @@ cmd({ pattern: "loan", desc: "loan take <amount> | loan pay <amount> | loan stat
               ``,
               `No outstanding debt. Good.`,
               ``,
-              `Borrow up to ${fmtMoney(MAX_LOAN)}`,
-              `⚠️ Interest: *4% every 5 minutes* (compounding)`,
-              `⚠️ After 2 hours: shark auto-deducts from your wallet + bank`,
+              `Borrow up to ${fmtMoney(MAX_LOAN)} | Rate: ${RATE_DISPLAY} (Credit score: ${_score}/850)`,
+              `⏳ 2hr grace period — no interest charged in first 2 hours`,
+              `⚠️ After 6 hours overdue: shark takes 20% of wallet+bank`,
               `Usage: *loan take <amount>*`
           ].join('\n'));
 
-          const age           = now() - loan.takenAt;
-          const nextCompound  = COMPOUND_INTERVAL - ((Date.now() - (loan.lastCompound || loan.takenAt)) % COMPOUND_INTERVAL);
-          const growthPct     = ((loan.owed / loan.principal - 1) * 100).toFixed(1);
+          const age       = now() - (loan.takenAt || 0);
+          const rateDisp  = loan.ratePerHour ? `${(loan.ratePerHour*100).toFixed(1)}%/hr` : '1%/hr';
+          const inGrace   = age < 2*60*60*1000;
+          const growthPct = ((loan.owed / loan.principal - 1) * 100).toFixed(1);
+          const projNext1h = Math.ceil(loan.owed * (1 + (loan.ratePerHour || 0.010)));
+          const projNext6h = Math.ceil(loan.owed * Math.pow(1 + (loan.ratePerHour || 0.010), 6));
 
           return reply([
               `🦈 *YOUR DEBT*`,
               ``,
               `📋 Original loan: ${fmtMoney(loan.principal)}`,
-              `💀 Currently owed: *${fmtMoney(loan.owed)}* (+${growthPct}%)`,
+              `💀 Currently owed: *${fmtMoney(loan.owed)}*${parseFloat(growthPct) > 0 ? ` (+${growthPct}%)` : ''}`,
               `⏱️ Taken: ${msToTime(age)} ago`,
+              inGrace ? `⏳ *Grace period active* — interest starts in ${msToTime(2*60*60*1000 - age)}` : ``,
               ``,
-              `⚠️ Next interest tick in: *${msToTime(nextCompound)}*`,
-              `📈 Rate: 2% per 5min (compounds — 2hr grace period before seizure)`,
+              `📈 Rate: *${rateDisp}* (compounding hourly)`,
+              `   If unpaid — in 1hr: ~${fmtMoney(projNext1h)} | in 6hr: ~${fmtMoney(projNext6h)}`,
               ``,
               `Pay now: *loan pay <amount>*`,
               `Pay all: *loan pay all*`
-          ].join('\n'));
+          ].filter(s => s !== '').join('\n'));
       }
 
       if (sub === 'take') {
@@ -1877,30 +2601,39 @@ cmd({ pattern: "loan", desc: "loan take <amount> | loan pay <amount> | loan stat
           if (!amount || amount <= 0) return reply(`Usage: loan take <amount>\nMax: ${fmtMoney(MAX_LOAN)}`);
           if (amount > MAX_LOAN) return reply(`Max loan is ${fmtMoney(MAX_LOAN)}.`);
 
-          const initialOwed = Math.ceil(amount * 1.04); // first 5-min tick already baked in
-          acc.money += amount;
+          // Determine rate from credit score (mirrors getAccount logic)
+          const hourlyRate = _score >= 750 ? 0.005 : _score >= 680 ? 0.008 : _score >= 580 ? 0.010 : _score >= 480 ? 0.012 : 0.015;
+          // Project balances (2hr grace — interest starts after grace period)
+          const proj6h  = Math.ceil(amount * Math.pow(1 + hourlyRate, 4));   // 6h - 2h grace = 4h interest
+          const proj24h = Math.ceil(amount * Math.pow(1 + hourlyRate, 22));  // 24h - 2h grace = 22h interest
+          const proj72h = Math.ceil(amount * Math.pow(1 + hourlyRate, 70));  // 3d - 2h grace = 70h interest
+
+          acc.money = capBalance((acc.money||0) + amount);
           acc.activeLoan = {
               principal:    amount,
-              owed:         initialOwed,
+              owed:         amount,         // no initial markup — grace period covers first 2h
               takenAt:      now(),
-              lastCompound: now(),
+              lastCompound: now() + (2 * 60 * 60 * 1000), // interest clock starts after 2hr grace
+              creditScore:  _score,
+              ratePerHour:  hourlyRate,
+              lastAutoDeduct: 0,
           };
-          logFinancial(acc, `Loan from shark — owes ${fmtMoney(initialOwed)}`, amount);
+          logFinancial(acc, `Shark loan: ${fmtMoney(amount)} at ${(hourlyRate*100).toFixed(1)}%/hr`, amount);
           await saveAccount(acc);
           return reply([
               `🦈 *LOAN APPROVED*`,
               ``,
               `💵 Borrowed: *${fmtMoney(amount)}*`,
-              `💀 Starting debt: *${fmtMoney(initialOwed)}*`,
+              `📊 Credit score: ${_score}/850 → Rate: *${(hourlyRate*100).toFixed(1)}%/hr*`,
               ``,
-              `⚠️ *Interest: 4% every 5 minutes — it compounds.*`,
-              `   In 30 min: ~${fmtMoney(Math.ceil(initialOwed * Math.pow(1.02, 6)))}`,
-              `   In 1 hour: ~${fmtMoney(Math.ceil(initialOwed * Math.pow(1.02, 12)))}`,
-              `   In 6 hours: ~${fmtMoney(Math.ceil(initialOwed * Math.pow(1.02, 72)))}`,
-              `   In 24 hours: ~${fmtMoney(Math.ceil(initialOwed * Math.pow(1.02, 288)))}`,
+              `⏳ *2-hour grace period* — no interest until then`,
+              `📈 Projections if unpaid:`,
+              `   After 6 hours:  ~${fmtMoney(proj6h)}`,
+              `   After 24 hours: ~${fmtMoney(proj24h)}`,
+              `   After 3 days:   ~${fmtMoney(proj72h)}`,
               ``,
-              `🦈 The shark will start taking your money after 2 hours.`,
-              `Pay now: *loan pay all*`
+              `🦈 Shark takes 20% of wallet+bank every 6hr if overdue.`,
+              `Pay now: *loan pay all*  |  Check: *loan status*`
           ].join('\n'));
       }
 
@@ -1937,7 +2670,7 @@ cmd({ pattern: "loan", desc: "loan take <amount> | loan pay <amount> | loan stat
 // =============================================================================
 // PROTECT — Pay for temporary immunity from rob and gang rob attacks
 // =============================================================================
-cmd({ pattern: "protect", desc: "Buy temporary rob protection for 2 hours", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+cast({ pattern: "robshield", desc: "Buy temporary rob immunity for 2 hours", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -1983,7 +2716,7 @@ cmd({ pattern: "protect", desc: "Buy temporary rob protection for 2 hours", cate
 // CARWASH — Launder dirty crime money. Converts crimeLevel heat into clean cash.
 // The higher your heat, the bigger the laundry job — but it costs a 20% cut.
 // =============================================================================
-cmd({ pattern: "carwash", desc: "Launder dirty money (costs 20% cut)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "carwash", desc: "Launder dirty money (costs 20% cut)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -2050,7 +2783,7 @@ cmd({ pattern: "carwash", desc: "Launder dirty money (costs 20% cut)", category:
 // PICKPOCKET @player — silent micro-rob, no weapon needed, 10 min cooldown
 // Low risk, low reward. Can't fail into jail — just miss.
 // =============================================================================
-cmd({ pattern: "pickpocket", desc: "pickpocket @player — quietly lift their wallet", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "pickpocket", desc: "pickpocket @player — quietly lift their wallet", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id       = await getPlayerId(conn, m.sender);
       const targetId = await getTargetId(conn, mek, args, 0);
@@ -2104,10 +2837,11 @@ cmd({ pattern: "pickpocket", desc: "pickpocket @player — quietly lift their wa
 // =============================================================================
 // FENCE — Sell inventory items for quick cash (60% of blackmarket value)
 // =============================================================================
-cmd({ pattern: "fence", desc: "fence <item> [qty] — sell inventory to a fence", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "fence", desc: "fence <item> [qty] — sell inventory to a fence", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
+      if (isHospitalized(acc)) return reply(`⛓️ Action blocked — you're in ${acc.inJail ? 'jail' : 'hospital'}. Serve your time first.`);
 
       if (!args[0]) {
           const inv = acc.inventory || {};
@@ -2159,7 +2893,7 @@ cmd({ pattern: "fence", desc: "fence <item> [qty] — sell inventory to a fence"
 // =============================================================================
 if (!global.extortions) global.extortions = {}; // { victimId: { extorterId, amount, expiresAt } }
 
-cmd({ pattern: "extort", desc: "extort @player <amount> — demand protection money", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "extort", desc: "extort @player <amount> — demand protection money", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id       = await getPlayerId(conn, m.sender);
       const targetId = await getTargetId(conn, mek, args, 0);
@@ -2315,13 +3049,13 @@ async function handleCountdownCmd(conn, mek, m, { reply }) {
       return reply([`⏳ *YOUR ACTIVE TIMERS*`, ``, ...lines].join('\n'));
   } catch(e) { console.error('countdown error', e); }
 }
-cmd({ pattern: 'countdown', desc: 'See all your active cooldowns',  category: 'rpg', filename: __filename }, handleCountdownCmd);
-cmd({ pattern: 'timers',    desc: 'See cooldowns (alias: countdown)', category: 'rpg', filename: __filename }, handleCountdownCmd);
+cast({ pattern: 'countdown', desc: 'See all your active cooldowns',  category: 'rpg', filename: __filename }, handleCountdownCmd);
+cast({ pattern: 'timers',    desc: 'See cooldowns (alias: countdown)', category: 'rpg', filename: __filename }, handleCountdownCmd);
 
 // =============================================================================
 // AIRDROP — Creator drops cash to every player in a specific city
 // =============================================================================
-cmd({ pattern: "airdrop", desc: "[Creator] airdrop <city> <amount> — drop cash to all players in a city", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "airdrop", desc: "[Creator] airdrop <city> <amount> — drop cash to all players in a city", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id = await getPlayerId(conn, m.sender);
       if (id !== '2348084644182') return reply(`❌ Creator-only command.`);
@@ -2346,7 +3080,7 @@ cmd({ pattern: "airdrop", desc: "[Creator] airdrop <city> <amount> — drop cash
           const cityMap = { weirdosworld: 'Weirdos World', mexico: 'Mexico', london: 'London', japan: 'Japan', switzerland: 'Switzerland' };
           query = { location: cityMap[city] || city };
       }
-      const players = await db.collection('rpgplayers').find(query).toArray();
+      const players = await db.collection('weirdo_rpg').find(query).toArray();
       if (!players.length) return reply(`No players found in ${city}.`);
 
       const mentions = [];
@@ -2376,7 +3110,7 @@ cmd({ pattern: "airdrop", desc: "[Creator] airdrop <city> <amount> — drop cash
 // =============================================================================
 if (!global.duelChallenges) global.duelChallenges = {}; // { challengedId: { challengerId, amount, expiresAt } }
 
-cmd({ pattern: "duel", desc: "duel @player <amount> — challenge to a cash duel | duel accept", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "quickduel", desc: "quickduel @player <amount> — fast in-memory cash duel", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -2497,7 +3231,7 @@ cmd({ pattern: "duel", desc: "duel @player <amount> — challenge to a cash duel
 // TAXIRIDE — Pay to instantly move to any city without the flight timer
 // Costs significantly more than flying but skips the wait entirely
 // =============================================================================
-cmd({ pattern: "taxi", desc: "taxi <city> — instant travel, no flight timer (expensive)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "taxi", desc: "taxi <city> — instant travel, no flight timer (expensive)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -2610,7 +3344,7 @@ cmd({ pattern: "taxi", desc: "taxi <city> — instant travel, no flight timer (e
 // GIFT — Send items from your inventory to another player
 // gift @player <item> [qty] | gear slot | property
 // =============================================================================
-cmd({ pattern: "gift", desc: "gift @player <item|weapon|property> — send items, gear, or properties", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "gift", desc: "gift @player <item|weapon|property> — send items, gear, or properties", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id       = await getPlayerId(conn, m.sender);
       const targetId = await getTargetId(conn, mek, args, 0);
@@ -2706,7 +3440,7 @@ const PETS = {
     dragon:  { name: 'Dragon',  price: iC(50000000),    power: 200, bonus: { strBonus: 60, defBonus: 40, spdBonus: 20 }, icon: '🐉', desc: '+60 Str, +40 Def, +20 Spd. Breathes fire: 200 dmg.' },
 };
 
-cmd({ pattern: "pet", desc: "pet adopt <type> | pet feed | pet status | pet list", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "pet", desc: "pet adopt <type> | pet feed | pet status | pet list", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -2792,6 +3526,7 @@ cmd({ pattern: "pet", desc: "pet adopt <type> | pet feed | pet status | pet list
           if (acc.money < petDef.price) return reply(`${petDef.icon} *${petDef.name}* costs ${fmtMoney(petDef.price)}. You have ${fmtMoney(acc.money)}.`);
           acc.money -= petDef.price;
           acc.moneySpent = (acc.moneySpent || 0) + petDef.price;
+          logFinancial(acc, `🐾 Adopted pet: ${petDef.name}`, -petDef.price);
           const nickname = args.slice(2).join(' ').trim() || null;
           acc.pet = {
               type:        type,
@@ -2978,30 +3713,30 @@ async function handlePetTrainCmd(conn, mek, m, { args, reply }) {
         return reply(out.join('\n'));
     } catch(e) { console.error('pettrain error', e); }
 }
-cmd({ pattern: 'pettrain',  desc: 'Train your pet to make it stronger', category: 'rpg', filename: __filename }, handlePetTrainCmd);
-cmd({ pattern: 'trainpet',  desc: 'Train your pet (alias: pettrain)',   category: 'rpg', filename: __filename }, handlePetTrainCmd);
+cast({ pattern: 'pettrain',  desc: 'Train your pet to make it stronger', category: 'rpg', filename: __filename }, handlePetTrainCmd);
+cast({ pattern: 'trainpet',  desc: 'Train your pet (alias: pettrain)',   category: 'rpg', filename: __filename }, handlePetTrainCmd);
 
 // ── OBBY (Obstacle Course) ────────────────────────────────────────────────────
 // A timed obstacle course. Run it and get a cash reward based on your speed stat.
 // 30-min cooldown. Harder difficulties cost energy but pay more.
 const OBBY_TIERS = [
-  { name: 'Beginner',   energy: 10, baseReward: iC(2000),  speedReq: 0   },
-  { name: 'Normal',     energy: 20, baseReward: iC(8000),  speedReq: 20  },
-  { name: 'Hard',       energy: 35, baseReward: iC(25000), speedReq: 50  },
-  { name: 'Insane',     energy: 50, baseReward: iC(80000), speedReq: 100 },
-  { name: 'Impossible', energy: 80, baseReward: iC(250000),speedReq: 200 },
+  { name: 'Beginner',   energy: 15, speedReq: 0,   failChance: 0.20, endGain: 1, labGain: 1 },
+  { name: 'Normal',     energy: 25, speedReq: 20,  failChance: 0.25, endGain: 2, labGain: 1 },
+  { name: 'Hard',       energy: 40, speedReq: 50,  failChance: 0.35, endGain: 3, labGain: 2 },
+  { name: 'Insane',     energy: 60, speedReq: 100, failChance: 0.45, endGain: 5, labGain: 3 },
+  { name: 'Impossible', energy: 80, speedReq: 200, failChance: 0.55, endGain: 8, labGain: 5 },
 ];
 
-cmd({ pattern: "obby", desc: "obby [difficulty] — run an obstacle course for cash", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "course", desc: "course [difficulty] — stat training obstacle course (beginner/normal/hard/insane/impossible)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
       if (isHospitalized(acc)) return reply(`🚨 Can't run an obby from jail.`);
       if (isKidnapped(acc))    return reply(`🔒 You're kidnapped. Escape first.`);
 
-      const COOLDOWN = 30 * 60 * 1000;
+      const COOLDOWN = 45 * 60 * 1000; // 45min cooldown
       const last = acc.cooldowns?.obby || 0;
-      if (now() - last < COOLDOWN) return reply(`⏳ Catching your breath. Obby available in ${msToTime(COOLDOWN - (now()-last))}.`);
+      if (now() - last < COOLDOWN) return reply(`⏳ You're exhausted. Obby available in ${msToTime(COOLDOWN - (now()-last))}.`);
 
       const spd = (acc.speed || 3) + (getEconGearBonus(acc).spdBonus || 0) + (getPetBonus(acc).spdBonus || 0);
       const diffArg = (args[0] || '').toLowerCase();
@@ -3010,9 +3745,9 @@ cmd({ pattern: "obby", desc: "obby [difficulty] — run an obstacle course for c
       if (!diffArg) {
           let list = OBBY_TIERS.map(t => {
               const lock = spd < t.speedReq ? `🔒 Need ${t.speedReq} Spd` : `✅ Available`;
-              return `• *${t.name}* — ${fmtMoney(t.baseReward)} reward | ${t.energy} energy | ${lock}`;
+              return `• *${t.name}* — Endurance +${t.endGain} | Labor +${t.labGain} | ${t.energy} energy | ${lock} (stats only, no cash)`;
           }).join('\n');
-          return reply([`🏃 *OBBY — OBSTACLE COURSE*`, ``, `Your Speed: ${spd}`, ``, list, ``, `Run with: *obby <difficulty>* (e.g. obby hard)`].join('\n'));
+          return reply([`🏃 *COURSE — OBSTACLE COURSE*`, ``, `Your Speed: ${spd}`, ``, list, ``, `Run with: *course <difficulty>* (e.g. course hard)`].join('\n'));
       }
 
       const tier = OBBY_TIERS.find(t => t.name.toLowerCase() === diffArg);
@@ -3024,15 +3759,14 @@ cmd({ pattern: "obby", desc: "obby [difficulty] — run an obstacle course for c
       acc.cooldowns = acc.cooldowns || {};
       acc.cooldowns.obby = now();
 
-      // Speed-based completion: higher speed = faster clear = bigger bonus
-      const speedBonus = Math.floor((spd / Math.max(tier.speedReq, 1)) * 0.5 * tier.baseReward);
-      const totalGross = tier.baseReward + speedBonus;
-      const { net, vat } = applyVAT(totalGross);
+      // No cash reward — stats only
 
-      const FAIL_CHANCE = 0.15; // 15% chance to wipe out on a tricky jump
+      const FAIL_CHANCE = tier.failChance || 0.20;
       if (Math.random() < FAIL_CHANCE) {
           const dmg = 10 + Math.floor(Math.random() * 20);
           acc.health = Math.max(1, (acc.health || 100) - dmg);
+          // Failed: full 45min cooldown still applies — no free retry
+          acc.cooldowns.obby = now();
           await saveAccount(acc);
           return reply([
               `💥 *OBBY FAILED!*`,
@@ -3040,13 +3774,18 @@ cmd({ pattern: "obby", desc: "obby [difficulty] — run an obstacle course for c
               `You wiped out on the *${tier.name}* course!`,
               `❤️ Took ${dmg} fall damage. HP: ${acc.health}`,
               ``,
-              `Try again in 30 minutes.`
+              `⏳ Cooldown still applies — next attempt in *45 minutes*.`
           ].join('\n'));
       }
 
-      acc.money += net;
-      addTaxableIncome(acc, net);
-      logFinancial(acc, `Obby completion: ${tier.name}`, net);
+      // OBBY GIVES STATS ONLY — no money reward
+      acc.endurance   = (acc.endurance||0) + tier.endGain;
+      acc.labor       = (acc.labor||0) + tier.labGain;
+      acc.manualLabor = (acc.manualLabor||0) + 2;
+      // Every 5 endurance = +1 Max HP (capped at 500)
+      const oldHpBonus = Math.floor(((acc.endurance||0) - tier.endGain) / 5);
+      const newHpBonus = Math.floor((acc.endurance||0) / 5);
+      if (newHpBonus > oldHpBonus) acc.maxHealth = (acc.maxHealth||100) + (newHpBonus - oldHpBonus); // no cap
       await saveAccount(acc);
       return reply([
           `🏆 *OBBY COMPLETE!*`,
@@ -3054,9 +3793,11 @@ cmd({ pattern: "obby", desc: "obby [difficulty] — run an obstacle course for c
           `Course: *${tier.name}*`,
           `Speed: ${spd} | Energy used: ${tier.energy}`,
           ``,
-          `Base: ${fmtMoney(tier.baseReward)} + Speed bonus: ${fmtMoney(speedBonus)}`,
-          `VAT: -${fmtMoney(vat)} = *${fmtMoney(net)} net*`,
-      ].join('\n'));
+          `_Obby trains STATS only — no cash reward._`,
+          `💪 Endurance +${tier.endGain} → *${acc.endurance}*`,
+          `⚒️ Labor +${tier.labGain} → *${acc.labor}*`,
+          newHpBonus > oldHpBonus ? `❤️ Max HP increased to *${acc.maxHealth}*!` : `_(Every 5 endurance = +1 Max HP)_`,
+      ].filter(Boolean).join('\n'));
   } catch(e) { console.error('obby error', e); }
 });
 
@@ -3064,15 +3805,15 @@ cmd({ pattern: "obby", desc: "obby [difficulty] — run an obstacle course for c
 // Buy tycoon upgrades. Each one increases your passive income per claim tick.
 // tycoon buy <upgrade> | tycoon claim | tycoon status
 const TYCOON_UPGRADES = [
-  { id: 'droppers',   name: 'Droppers',       price: iC(10000),   incomePerMin: 50,   desc: 'Drops bricks for cash. Basic income.' },
-  { id: 'conveyor',   name: 'Conveyor Belt',  price: iC(50000),   incomePerMin: 200,  desc: 'Speeds up production.' },
-  { id: 'factory',    name: 'Factory Floor',  price: iC(200000),  incomePerMin: 800,  desc: 'Mass production unlocked.' },
-  { id: 'vault',      name: 'Money Vault',    price: iC(750000),  incomePerMin: 2500, desc: 'Secure vault multiplies output.' },
-  { id: 'launcher',   name: 'Cash Launcher',  price: iC(3000000), incomePerMin: 8000, desc: 'Launches cash directly into your wallet.' },
-  { id: 'megafactory',name: 'Mega Factory',   price: iC(15000000),incomePerMin: 35000,desc: 'Industrial empire. Top tier.' },
+  { id: 'droppers',   name: 'Droppers',       price: iC(50000),    incomePerMin: 8,    desc: 'Basic dropper. Very slow income.' },
+  { id: 'conveyor',   name: 'Conveyor Belt',  price: iC(250000),   incomePerMin: 30,   desc: 'Speeds up production a little.' },
+  { id: 'factory',    name: 'Factory Floor',  price: iC(1000000),  incomePerMin: 100,  desc: 'Mass production. Costly investment.' },
+  { id: 'vault',      name: 'Money Vault',    price: iC(5000000),  incomePerMin: 350,  desc: 'Secure vault. Strong returns.' },
+  { id: 'launcher',   name: 'Cash Launcher',  price: iC(20000000), incomePerMin: 1000, desc: 'High-end setup. Serious business.' },
+  { id: 'megafactory',name: 'Mega Factory',   price: iC(100000000),incomePerMin: 3500, desc: 'Top tier. Very expensive. Max yield.' },
 ];
 
-cmd({ pattern: "tycoon", desc: "tycoon status | tycoon buy <upgrade> | tycoon claim", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "tycoon", desc: "tycoon status | tycoon buy <upgrade> | tycoon claim", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id  = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -3120,9 +3861,12 @@ cmd({ pattern: "tycoon", desc: "tycoon status | tycoon buy <upgrade> | tycoon cl
           const lastClaim = tycoon.lastClaim || now();
           const minElapsed = Math.floor((now() - lastClaim) / 60000);
           if (minElapsed < 1) return reply(`⏳ Nothing to claim yet. Tycoon pays out every minute.`);
-          const earned = Math.min(minElapsed * perMin, perMin * 1440); // cap at 24h
+          const earned = Math.min(minElapsed * perMin, perMin * 360); // cap at 6h — collect regularly or lose it
           const { net, vat } = applyVAT(earned);
-          acc.money += net;
+          acc.money = capBalance((acc.money||0) + net);
+          acc.totalEarned = (acc.totalEarned||0) + net;
+          logFinancial(acc, `🏭 Tycoon claim (${minElapsed} min)`, net);
+          const tycLoanMsg = tryDeductLoan(acc, net, 'Tycoon payout');
           addTaxableIncome(acc, net);
           acc.tycoon = { ...tycoon, lastClaim: now() };
           logFinancial(acc, `Tycoon claim (${minElapsed} min)`, net);
@@ -3132,8 +3876,9 @@ cmd({ pattern: "tycoon", desc: "tycoon status | tycoon buy <upgrade> | tycoon cl
               ``,
               `Time since last claim: ${minElapsed} minutes`,
               `Rate: ${fmtMoney(perMin)}/min`,
-              `Gross: ${fmtMoney(earned)} — VAT: -${fmtMoney(vat)} = *${fmtMoney(net)} net*`
-          ].join('\n'));
+              `Gross: ${fmtMoney(earned)} — VAT: -${fmtMoney(vat)} = *${fmtMoney(net)} net*`,
+              tycLoanMsg,
+          ].filter(Boolean).join('\n'));
       }
 
       if (sub === 'buy') {
@@ -3144,6 +3889,7 @@ cmd({ pattern: "tycoon", desc: "tycoon status | tycoon buy <upgrade> | tycoon cl
           if (acc.money < upgrade.price) return reply(`💸 *${upgrade.name}* costs ${fmtMoney(upgrade.price)}. You have ${fmtMoney(acc.money)}.`);
           acc.money -= upgrade.price;
           acc.moneySpent = (acc.moneySpent || 0) + upgrade.price;
+          logFinancial(acc, `🏭 Tycoon: bought ${upgrade.name}`, -upgrade.price);
           acc.tycoon = { ...tycoon, [upgradeId]: true, lastClaim: tycoon.lastClaim || now() };
           logFinancial(acc, `Tycoon upgrade: ${upgrade.name}`, -upgrade.price);
           await saveAccount(acc);
@@ -3166,7 +3912,7 @@ cmd({ pattern: "tycoon", desc: "tycoon status | tycoon buy <upgrade> | tycoon cl
 // ── SWORD FIGHT (Roblox classic) ─────────────────────────────────────────────
 // Quick 1v1 duel with swords — no stats needed, pure RNG with skill element.
 // Win streaks give multiplier bonuses. 5-min cooldown.
-cmd({ pattern: "swordfight", desc: "swordfight @player — classic Roblox-style sword duel", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "swordfight", desc: "swordfight @player — classic Roblox-style sword duel", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id       = await getPlayerId(conn, m.sender);
       const targetId = await getTargetId(conn, mek, args, 0);
@@ -3271,7 +4017,7 @@ async function handlePizzaJobCmd(conn, mek, m, { reply }) {
       const gross = job.pay[0] + Math.floor(Math.random() * (job.pay[1] - job.pay[0]));
       const { net, vat } = applyVAT(gross);
 
-      acc.money += net;
+      acc.money = capBalance((acc.money||0) + net);
       addTaxableIncome(acc, net);
       acc.cooldowns = acc.cooldowns || {};
       acc.cooldowns.pizzajob = now();
@@ -3291,13 +4037,13 @@ async function handlePizzaJobCmd(conn, mek, m, { reply }) {
       ].join('\n'));
   } catch(e) { console.error('pizzajob error', e); }
 }
-cmd({ pattern: 'pizzajob',    desc: 'Work at a pizza place (Roblox)', category: 'rpg', filename: __filename }, handlePizzaJobCmd);
-cmd({ pattern: 'workatpizza', desc: 'Pizza job (alias: pizzajob)',    category: 'rpg', filename: __filename }, handlePizzaJobCmd);
+cast({ pattern: 'pizzajob',    desc: 'Work at a pizza place (Roblox)', category: 'rpg', filename: __filename }, handlePizzaJobCmd);
+cast({ pattern: 'workatpizza', desc: 'Pizza job (alias: pizzajob)',    category: 'rpg', filename: __filename }, handlePizzaJobCmd);
 
 // ── JAILBREAK (Roblox tribute) ────────────────────────────────────────────────
 // If you're in jail, attempt a Roblox-style jailbreak. Riskier than bailout
 // but free if it works. Others can help break you out.
-cmd({ pattern: "jailbreak", desc: "Attempt a Roblox-style jailbreak from prison", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+cast({ pattern: "jailbreak", desc: "Attempt a Roblox-style jailbreak from prison", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
       const id = await getPlayerId(conn, m.sender);
       const acc = await getAccount(id);
@@ -3312,15 +4058,16 @@ cmd({ pattern: "jailbreak", desc: "Attempt a Roblox-style jailbreak from prison"
       if (!isExternal && !isHospitalized(acc))     return reply(`You're not in jail. Nothing to break out of.`);
       if (!isExternal && isKidnapped(acc))         return reply(`🔒 You're kidnapped, not jailed. Use escape instead.`);
 
-      const COOLDOWN = 15 * 60 * 1000;
+      const COOLDOWN = 45 * 60 * 1000; // 45min cooldown — jailbreaks are hard
       const last = acc.cooldowns?.jailbreak || 0;
-      if (now() - last < COOLDOWN) return reply(`⏳ Last attempt failed. Lay low for ${msToTime(COOLDOWN - (now()-last))}.`);
+      if (now() - last < COOLDOWN) return reply(`⏳ Last attempt failed. Guards are watching. Lay low for ${msToTime(COOLDOWN - (now()-last))}.`);
 
       acc.cooldowns = acc.cooldowns || {};
       acc.cooldowns.jailbreak = now();
 
       const spd    = (acc.speed || 3) + (getEconGearBonus(acc).spdBonus || 0);
-      const chance = Math.min(0.70, 0.25 + (spd / 300));
+      // Much lower chance: max 35% even with high speed
+      const chance = Math.min(0.35, 0.08 + (spd / 500));
 
       if (Math.random() < chance) {
           prisoner.jailedUntil = 0;
@@ -3349,10 +4096,11 @@ cmd({ pattern: "jailbreak", desc: "Attempt a Roblox-style jailbreak from prison"
               mentions: isExternal ? [toJid(id), toJid(prisonerId)] : [toJid(id)]
           }, { quoted: mek });
       } else {
-          // Failed — extra jail time added
-          const extra = 5 * 60 * 1000;
+          // Failed — guards add significant time + raise crime level
+          const extra = 30 * 60 * 1000; // 30 min added, not 5
           if (!isExternal) {
               acc.jailedUntil = (acc.jailedUntil || now()) + extra;
+              acc.crimeLevel  = Math.min(100, (acc.crimeLevel || 0) + 15);
           }
           await saveAccount(acc);
           const failFlavour = [
@@ -3404,8 +4152,7 @@ function registerEconomy(conn) {
 
         const leveled = await addExp(acc, 1);
         if (leveled) {
-            // Level-up notification silenced — XP/level logic still runs
-            // conn.sendMessage(from, { text: `🎉 @${id} has leveled up to Level ${acc.level} through active chatting!`, mentions: [toJid(id)] }, { quoted: mek });
+            // Level-up through chatting is silent — XP/level still awarded, no announcement
         }
       } catch (e) { }
     });
@@ -3421,3 +4168,55 @@ module.exports = {
   saveAccount,
   registerEconomy
 };
+
+cast({ pattern: "workingstats", desc: "View your working stats (Manual Labor, Intelligence, Endurance)", category: "rpg", filename: __filename }, async (conn, mek, m, { reply }) => {
+  try {
+      const id  = await getPlayerId(conn, m.sender);
+      const acc = await getAccount(id);
+      const manualLabor = acc.manualLabor || 0;
+      const intelligence = acc.intelligence || 1;
+      const endurance   = acc.endurance || 0;
+      const nerve       = acc.nerve ?? 60;
+      const maxNerve    = acc.maxNerve || (60 + Math.floor((acc.level||1)/5));
+      const total       = manualLabor + intelligence + endurance;
+      return reply([
+          `📊 *WORKING STATS — ${acc.username || id}*`, ``,
+          `💪 Manual Labor: *${manualLabor.toLocaleString()}*`,
+          `   Grows from: shifts, obby, physical work`,
+          `🧠 Intelligence: *${intelligence.toLocaleString()}*`,
+          `   Grows from: education, crimes, studying`,
+          `🏃 Endurance: *${endurance.toLocaleString()}*`,
+          `   Grows from: training, obby courses, fights`,
+          `😤 Nerve: *${nerve}/${maxNerve}*`,
+          `   Used for: crimes | Regens 1 per 5 minutes`,
+          ``,
+          `📈 Total Working Stats: *${total.toLocaleString()}*`
+      ].join('\n'));
+  } catch(e) { console.error('workingstats error', e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMMAND: pay — Alias for wire (friendlier name)
+// ─────────────────────────────────────────────────────────────────────────────
+cast({ pattern: "pay", desc: "pay @player <amount> — Alias for wire", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
+  try {
+      // Just forward to wire logic
+      const id = await getPlayerId(conn, m.sender);
+      const acc = await getAccount(id);
+      const targetId = await getTargetId(conn, mek, args, 0);
+      const amount = parseInt(args[1]);
+      if (!targetId || !amount || amount <= 0) return reply(`Usage: pay @player <amount>\nThis is an alias for *wire* — 10% transfer fee applies.`);
+      if ((acc.money||0) < -100000) return reply(`🔴 Your wallet is ${fmtMoney(acc.money)}. Clear your debts first.`);
+      const rec = await getAccount(targetId);
+      const wireFee = Math.ceil(amount * 0.10);
+      const totalCost = amount + wireFee;
+      if (acc.money < totalCost) return reply(`Not enough funds. Need ${fmtMoney(totalCost)} (amount + 10% fee). Have ${fmtMoney(acc.money)}.`);
+      acc.money -= totalCost;
+      rec.money = Math.min(999000000000, (rec.money||0) + amount);
+      const loanMsg = tryDeductLoan(rec, amount, `Payment from @${id}`);
+      logFinancial(acc, `Pay → @${targetId}`, -totalCost);
+      logFinancial(rec, `Pay ← @${id}`, amount);
+      await saveAccount(acc); await saveAccount(rec);
+      return conn.sendMessage(m.chat, { text: `💸 Sent *${fmtMoney(amount)}* to @${targetId}\n🏛️ Fee (10%): -${fmtMoney(wireFee)}${loanMsg}`, mentions: [toJid(targetId)] }, { quoted: mek });
+  } catch(e) { console.error('pay error', e); }
+});
