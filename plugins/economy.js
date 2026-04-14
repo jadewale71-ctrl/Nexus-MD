@@ -3,7 +3,7 @@
 // FULLY INTEGRATED WITH RPG ECOSYSTEM (`rpgplayers` collection)
 // v4.0 — Location-locked Rob, Gear-based Stats, Gang Rob, Economy Drains Toggle
 
-const { cast, makeSmartQuote } = require('../cast');
+const { cast, cmd } = require("../cast");
 const { MongoClient } = require("mongodb");
 const { lidToPhone } = require("../lib/lid");
 
@@ -199,7 +199,7 @@ async function getAccount(id) {
               // Pay the extorter
               try {
                   const db = await connectDB();
-                  await db.collection('rpgplayers').updateOne({ _id: ext.extorterId }, { $inc: { money: pay } });
+                  await db.collection('weirdo_rpg').updateOne({ _id: ext.extorterId }, { $inc: { money: pay } });
               } catch(_) {}
           }
           delete global.extortions[acc._id];
@@ -1110,7 +1110,7 @@ cast({ pattern: "underworld", desc: "Buy from black market (alias: deal)", categ
 // invest withdraw <slot>        — pull out early (lose 20% as penalty)
 // invest claim <slot>           — collect matured investment
 // =============================================================================
-const MAX_INV_SLOTS = 5;
+const MAX_INV_SLOTS = 20;
 const INV_TERMS = {
     '30m':  { ms: 30*60*1000,    baseRate: 0.02,  label: '30 min' },
     '1h':   { ms: 60*60*1000,    baseRate: 0.05,  label: '1 hour' },
@@ -1183,57 +1183,52 @@ cast({ pattern: "invest", desc: "invest status | invest <slot> <amount> <term> |
               const left = inv.termMs - (nowTs - inv.boughtAt);
               return reply(`⏳ Slot ${slot} isn't mature yet. ${msToTime(left)} remaining.\nUse *invest withdraw ${slot}* to exit early (−20% penalty).`);
           }
-          // ── Market risk — longer terms carry higher loss chance ──────────────
-          const econM2 = Math.max(0.4, Math.min(2.0, global.ECON_INDEX ?? 1.0));
-          // Bear market = more risk; bull = less. Term > 12h = higher exposure.
-          const baseRisk   = econM2 < 0.7 ? 0.35 : econM2 < 1.0 ? 0.18 : 0.08;
-          const termRisk   = inv.termMs >= 24*60*60*1000 ? 0.12 : inv.termMs >= 12*60*60*1000 ? 0.07 : inv.termMs >= 6*60*60*1000 ? 0.04 : 0.01;
-          const totalRisk  = Math.min(0.45, baseRisk + termRisk);
-          const roll       = Math.random();
+          // Risk model — longer terms = higher return but also higher loss risk
+          // Loss chance increases with term length, decreases slightly in bull market
+          const RISK = { '30m': 0.08, '1h': 0.12, '3h': 0.18, '6h': 0.24, '12h': 0.30, '24h': 0.38 };
+          const econM2    = Math.max(0.4, Math.min(2.0, global.ECON_INDEX ?? 1.0));
+          const riskBase  = RISK[inv.term] || 0.20;
+          const riskAdj   = Math.max(0.02, riskBase - (econM2 - 1.0) * 0.08); // bull market reduces risk
+          const roll      = Math.random();
 
-          if (roll < totalRisk * 0.4) {
+          let payout, profit, outcomeMsg;
+          if (roll < riskAdj * 0.4) {
               // Total loss — market crashed
+              payout = 0; profit = -inv.amount;
               acc.investments.splice(idx, 1);
               await saveAccount(acc);
+              logFinancial(acc, `Investment slot ${slot} TOTAL LOSS`, -inv.amount);
               return reply([
                   `📉 *INVESTMENT LOST — Slot ${slot}*`, ``,
-                  `The market collapsed on your position.`,
-                  `💸 Lost: *${fmtMoney(inv.amount)}*`,
-                  `💰 Balance: ${fmtMoney(acc.money)}`,
-                  `_Risk is real. Not every investment pays off._`
+                  `The market crashed on your *${inv.term}* investment.`,
+                  `Principal *${fmtMoney(inv.amount)}* lost entirely.`,
+                  `_Risk is part of investing. Better luck next time._`
               ].join('\n'));
-          } else if (roll < totalRisk) {
-              // Partial loss — returned only 50-85% of principal, no profit
-              const returnPct = 0.50 + Math.random() * 0.35;
-              const returned  = Math.floor(inv.amount * returnPct);
-              const lost      = inv.amount - returned;
-              acc.money += returned;
-              logFinancial(acc, `Investment slot ${slot} partial loss`, -lost);
-              acc.investments.splice(idx, 1);
-              await saveAccount(acc);
-              return reply([
-                  `📉 *INVESTMENT UNDERPERFORMED — Slot ${slot}*`, ``,
-                  `Market conditions were unfavourable.`,
-                  `💸 Principal lost: *-${fmtMoney(lost)}*`,
-                  `💵 Recovered: *${fmtMoney(returned)}* (${(returnPct*100).toFixed(0)}% of principal)`,
-                  `💰 Balance: ${fmtMoney(acc.money)}`
-              ].join('\n'));
+          } else if (roll < riskAdj) {
+              // Partial loss — lost some principal
+              const lossPct = 0.10 + Math.random() * 0.40; // lose 10-50%
+              payout        = Math.floor(inv.amount * (1 - lossPct));
+              profit        = payout - inv.amount;
+              outcomeMsg    = `📉 Partial loss (market dip): *-${fmtMoney(-profit)}* (${(lossPct*100).toFixed(0)}% lost)`;
+          } else {
+              // Success — normal payout
+              payout     = Math.floor(inv.amount * (1 + inv.rate));
+              profit     = payout - inv.amount;
+              outcomeMsg = `📈 Profit: *+${fmtMoney(profit)}* (${(inv.rate*100).toFixed(1)}%)`;
           }
 
-          // Success path (majority of the time)
-          const payout = Math.floor(inv.amount * (1 + inv.rate));
-          const profit  = payout - inv.amount;
           acc.money += payout;
-          addTaxableIncome(acc, profit);
-          logFinancial(acc, `Investment slot ${slot} matured`, profit);
+          if (profit > 0) addTaxableIncome(acc, profit);
+          logFinancial(acc, `Investment slot ${slot} ${profit >= 0 ? 'profit' : 'partial loss'}`, profit);
           acc.investments.splice(idx, 1);
           await saveAccount(acc);
           return reply([
-              `✅ *INVESTMENT CLAIMED — Slot ${slot}*`, ``,
+              `${profit >= 0 ? '✅' : '⚠️'} *INVESTMENT CLAIMED — Slot ${slot}*`, ``,
               `Principal: ${fmtMoney(inv.amount)}`,
-              `Profit: *+${fmtMoney(profit)}* (${(inv.rate*100).toFixed(1)}%)`,
-              `Total paid out: *${fmtMoney(payout)}*`,
-              `💰 New balance: ${fmtMoney(acc.money)}`
+              outcomeMsg,
+              `Total received: *${fmtMoney(payout)}*`,
+              `💰 New balance: ${fmtMoney(acc.money)}`,
+              `_Risk: ${(riskAdj*100).toFixed(0)}% chance of loss on ${inv.term} term_`
           ].join('\n'));
       }
 
@@ -1286,8 +1281,10 @@ cast({ pattern: "invest", desc: "invest status | invest <slot> <amount> <term> |
       if (acc.money < amount) return reply(`Not enough cash. Have: ${fmtMoney(acc.money)}`);
       if (amount < 1000) return reply(`Minimum investment is ${fmtMoney(1000)}.`);
 
+      const RISK_DISPLAY = { '30m': 8, '1h': 12, '3h': 18, '6h': 24, '12h': 30, '24h': 38 };
       const rate = +(termDef.baseRate * econM).toFixed(4);
       const projectedReturn = Math.floor(amount * (1 + rate));
+      const riskPct = Math.max(2, (RISK_DISPLAY[termKey] || 20) - Math.floor((econM - 1.0) * 8));
 
       acc.money -= amount;
       acc.investments.push({ slot, amount, boughtAt: nowTs, termMs: termDef.ms, rate, term: termKey });
@@ -1298,6 +1295,7 @@ cast({ pattern: "invest", desc: "invest status | invest <slot> <amount> <term> |
           `Invested: *${fmtMoney(amount)}*`,
           `Term: *${termDef.label}* | Rate: *${(rate*100).toFixed(1)}%*`,
           `Projected return: *${fmtMoney(projectedReturn)}* (+${fmtMoney(projectedReturn - amount)})`,
+          `⚠️ Loss risk: *${riskPct}%* — investments can fail`,
           `Market: ${econLabel}`,
           `Matures: ${new Date(nowTs + termDef.ms).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'})}`,
           ``,
@@ -3080,13 +3078,13 @@ cast({ pattern: "airdrop", desc: "[Creator] airdrop <city> <amount> — drop cas
           const cityMap = { weirdosworld: 'Weirdos World', mexico: 'Mexico', london: 'London', japan: 'Japan', switzerland: 'Switzerland' };
           query = { location: cityMap[city] || city };
       }
-      const players = await db.collection('weirdo_rpg').find(query).toArray();
+      const players = await db.collection('weirdo_rpg').find({ ...query, isChildNpc: { $ne: true } }).toArray();
       if (!players.length) return reply(`No players found in ${city}.`);
 
       const mentions = [];
       for (const p of players) {
           p.money = (p.money || 0) + amount;
-          await db.collection('rpgplayers').updateOne({ _id: p._id }, { $inc: { money: amount } });
+          await db.collection('weirdo_rpg').updateOne({ _id: p._id }, { $inc: { money: amount } });
           mentions.push(toJid(p._id));
       }
 
@@ -3727,91 +3725,6 @@ const OBBY_TIERS = [
   { name: 'Impossible', energy: 80, speedReq: 200, failChance: 0.55, endGain: 8, labGain: 5 },
 ];
 
-cast({ pattern: "course", desc: "course [difficulty] — stat training obstacle course (beginner/normal/hard/insane/impossible)", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
-  try {
-      const id  = await getPlayerId(conn, m.sender);
-      const acc = await getAccount(id);
-      if (isHospitalized(acc)) return reply(`🚨 Can't run an obby from jail.`);
-      if (isKidnapped(acc))    return reply(`🔒 You're kidnapped. Escape first.`);
-
-      const COOLDOWN = 45 * 60 * 1000; // 45min cooldown
-      const last = acc.cooldowns?.obby || 0;
-      if (now() - last < COOLDOWN) return reply(`⏳ You're exhausted. Obby available in ${msToTime(COOLDOWN - (now()-last))}.`);
-
-      const spd = (acc.speed || 3) + (getEconGearBonus(acc).spdBonus || 0) + (getPetBonus(acc).spdBonus || 0);
-      const diffArg = (args[0] || '').toLowerCase();
-      const available = OBBY_TIERS.filter(t => spd >= t.speedReq);
-
-      if (!diffArg) {
-          let list = OBBY_TIERS.map(t => {
-              const lock = spd < t.speedReq ? `🔒 Need ${t.speedReq} Spd` : `✅ Available`;
-              return `• *${t.name}* — Endurance +${t.endGain} | Labor +${t.labGain} | ${t.energy} energy | ${lock} (stats only, no cash)`;
-          }).join('\n');
-          return reply([`🏃 *COURSE — OBSTACLE COURSE*`, ``, `Your Speed: ${spd}`, ``, list, ``, `Run with: *course <difficulty>* (e.g. course hard)`].join('\n'));
-      }
-
-      const tier = OBBY_TIERS.find(t => t.name.toLowerCase() === diffArg);
-      if (!tier) return reply(`Unknown difficulty. Try: beginner, normal, hard, insane, impossible`);
-      if (spd < tier.speedReq) return reply(`🔒 *${tier.name}* requires ${tier.speedReq} Speed. You have ${spd}.`);
-      if ((acc.energy || 0) < tier.energy) return reply(`⚡ Not enough energy. Need ${tier.energy}, have ${acc.energy || 0}.`);
-
-      acc.energy -= tier.energy;
-      acc.cooldowns = acc.cooldowns || {};
-      acc.cooldowns.obby = now();
-
-      // No cash reward — stats only
-
-      const FAIL_CHANCE = tier.failChance || 0.20;
-      if (Math.random() < FAIL_CHANCE) {
-          const dmg = 10 + Math.floor(Math.random() * 20);
-          acc.health = Math.max(1, (acc.health || 100) - dmg);
-          // Failed: full 45min cooldown still applies — no free retry
-          acc.cooldowns.obby = now();
-          await saveAccount(acc);
-          return reply([
-              `💥 *OBBY FAILED!*`,
-              ``,
-              `You wiped out on the *${tier.name}* course!`,
-              `❤️ Took ${dmg} fall damage. HP: ${acc.health}`,
-              ``,
-              `⏳ Cooldown still applies — next attempt in *45 minutes*.`
-          ].join('\n'));
-      }
-
-      // OBBY GIVES STATS ONLY — no money reward
-      acc.endurance   = (acc.endurance||0) + tier.endGain;
-      acc.labor       = (acc.labor||0) + tier.labGain;
-      acc.manualLabor = (acc.manualLabor||0) + 2;
-      // Every 5 endurance = +1 Max HP (capped at 500)
-      const oldHpBonus = Math.floor(((acc.endurance||0) - tier.endGain) / 5);
-      const newHpBonus = Math.floor((acc.endurance||0) / 5);
-      if (newHpBonus > oldHpBonus) acc.maxHealth = (acc.maxHealth||100) + (newHpBonus - oldHpBonus); // no cap
-      await saveAccount(acc);
-      return reply([
-          `🏆 *OBBY COMPLETE!*`,
-          ``,
-          `Course: *${tier.name}*`,
-          `Speed: ${spd} | Energy used: ${tier.energy}`,
-          ``,
-          `_Obby trains STATS only — no cash reward._`,
-          `💪 Endurance +${tier.endGain} → *${acc.endurance}*`,
-          `⚒️ Labor +${tier.labGain} → *${acc.labor}*`,
-          newHpBonus > oldHpBonus ? `❤️ Max HP increased to *${acc.maxHealth}*!` : `_(Every 5 endurance = +1 Max HP)_`,
-      ].filter(Boolean).join('\n'));
-  } catch(e) { console.error('obby error', e); }
-});
-
-// ── TYCOON — Passive business empire ─────────────────────────────────────────
-// Buy tycoon upgrades. Each one increases your passive income per claim tick.
-// tycoon buy <upgrade> | tycoon claim | tycoon status
-const TYCOON_UPGRADES = [
-  { id: 'droppers',   name: 'Droppers',       price: iC(50000),    incomePerMin: 8,    desc: 'Basic dropper. Very slow income.' },
-  { id: 'conveyor',   name: 'Conveyor Belt',  price: iC(250000),   incomePerMin: 30,   desc: 'Speeds up production a little.' },
-  { id: 'factory',    name: 'Factory Floor',  price: iC(1000000),  incomePerMin: 100,  desc: 'Mass production. Costly investment.' },
-  { id: 'vault',      name: 'Money Vault',    price: iC(5000000),  incomePerMin: 350,  desc: 'Secure vault. Strong returns.' },
-  { id: 'launcher',   name: 'Cash Launcher',  price: iC(20000000), incomePerMin: 1000, desc: 'High-end setup. Serious business.' },
-  { id: 'megafactory',name: 'Mega Factory',   price: iC(100000000),incomePerMin: 3500, desc: 'Top tier. Very expensive. Max yield.' },
-];
 
 cast({ pattern: "tycoon", desc: "tycoon status | tycoon buy <upgrade> | tycoon claim", category: "rpg", filename: __filename }, async (conn, mek, m, { args, reply }) => {
   try {
@@ -4152,7 +4065,7 @@ function registerEconomy(conn) {
 
         const leveled = await addExp(acc, 1);
         if (leveled) {
-            // Level-up through chatting is silent — XP/level still awarded, no announcement
+            conn.sendMessage(from, { text: `🎉 @${id} has leveled up to Level ${acc.level} through active chatting!`, mentions: [toJid(id)] });
         }
       } catch (e) { }
     });
